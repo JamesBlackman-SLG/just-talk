@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
 
     // Preflight checks
     paste::check_wtype()?;
-    let transcriber = Arc::new(transcribe::Transcriber::new(args.server)?);
+    let transcriber = Arc::new(transcribe::Transcriber::new(args.server));
     let audio = audio::AudioCapture::new()?;
     let audio_handle = audio.buffer_handle();
 

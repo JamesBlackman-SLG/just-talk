@@ -1,0 +1,19 @@
+services:
+  nemospeech:
+    build: ./nemospeech
+    ports:
+      - "5051:5051"
+    volumes:
+      # Bind-mount host HuggingFace cache so the model doesn't re-download
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped

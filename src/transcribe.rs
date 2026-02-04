@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 use ureq::unversioned::multipart::{Form, Part};
 
 const DEFAULT_SERVER: &str = "http://localhost:5051";
@@ -10,21 +10,22 @@ pub struct Transcriber {
 }
 
 impl Transcriber {
-    pub fn new(server_url: Option<String>) -> Result<Self> {
+    pub fn new(server_url: Option<String>) -> Self {
         let server_url = server_url.unwrap_or_else(|| {
             std::env::var("NEMOSPEECH_URL").unwrap_or_else(|_| DEFAULT_SERVER.to_string())
         });
 
-        // Health check
+        // Non-fatal health check — server may not be up yet
         let health_url = format!("{}/health", server_url);
-        ureq::get(&health_url)
-            .call()
-            .context(format!(
-                "nemospeech server not reachable at {server_url} - is it running?"
-            ))?;
+        match ureq::get(&health_url).call() {
+            Ok(_) => info!(server = %server_url, "transcriber ready (nemospeech)"),
+            Err(_) => warn!(
+                server = %server_url,
+                "nemospeech not reachable yet — will connect on first use"
+            ),
+        }
 
-        info!(server = %server_url, "transcriber ready (nemospeech)");
-        Ok(Self { server_url })
+        Self { server_url }
     }
 
     /// WebSocket URL for streaming transcription.
