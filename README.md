@@ -18,7 +18,7 @@ AltGr held:
 AltGr released:
   +-- Final transcription of complete audio
   +-- Text flies toward cursor with bezier spiral animation
-  +-- Text pasted via wtype
+  +-- Text pasted at cursor (wtype for Wayland apps, xdotool for XWayland/Electron)
 ```
 
 ## Demo
@@ -27,13 +27,56 @@ Hold AltGr and speak. Words appear in a floating panel as you talk, with a speec
 
 ## Prerequisites
 
-- **Wayland compositor** with wlr-layer-shell support (Hyprland, Sway, etc.)
+### Hardware
+
+- **NVIDIA GPU** with CUDA support (tested on RTX 4090; the Nemotron 0.6B model uses ~2 GB VRAM)
+
+### System
+
+- **Linux** with a **Wayland compositor** supporting wlr-layer-shell (Hyprland, Sway, etc.)
+- **Hyprland** recommended — `hyprctl` is used for cursor position and XWayland window detection
 - **PipeWire** (or PulseAudio) for audio capture
-- **wtype** for text injection (`pacman -S wtype`)
-- **hyprctl** for cursor position (Hyprland-specific, falls back to screen center otherwise)
-- **NVIDIA GPU** with CUDA for the transcription server
-- **Python 3.10+** with [uv](https://github.com/astral-sh/uv) for the ASR server
-- User must be in the `input` group for evdev key capture: `sudo usermod -aG input $USER`
+- User must be in the `input` group for evdev key capture:
+  ```bash
+  sudo usermod -aG input $USER
+  ```
+  Log out and back in after adding the group.
+
+### Client packages
+
+Install via pacman (Arch/CachyOS) or your distro's package manager:
+
+```bash
+sudo pacman -S wtype wl-clipboard xdotool
+```
+
+| Package | Purpose |
+|---------|---------|
+| **wtype** | Text injection for native Wayland apps |
+| **wl-clipboard** | Clipboard access (`wl-copy`) — text is always copied to clipboard as a backup |
+| **xdotool** | Text injection for XWayland apps (Electron/Chromium: WhatsApp Web, Cursor, VS Code, etc.) |
+
+### Rust toolchain
+
+- **Rust 1.85+** (edition 2024) — install via [rustup](https://rustup.rs/)
+
+### Transcription server (choose one)
+
+**Option A: Docker (recommended)**
+
+Requires [Docker](https://docs.docker.com/engine/install/) and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html):
+
+```bash
+sudo pacman -S docker nvidia-container-toolkit
+sudo systemctl enable --now docker
+```
+
+**Option B: Native Python**
+
+- **Python 3.10+**
+- **[uv](https://github.com/astral-sh/uv)** package manager
+- **CUDA toolkit** and **cuDNN** matching your driver version
+- **libsndfile** (`sudo pacman -S libsndfile`)
 
 ## Setup
 
@@ -45,15 +88,25 @@ cargo build --release
 
 ### 2. Start the transcription server
 
-The `nemospeech/` directory contains a FastAPI server wrapping NVIDIA's Nemotron ASR model.
+The `nemospeech/` directory contains a FastAPI server wrapping NVIDIA's Nemotron ASR model (`nvidia/nemotron-speech-streaming-en-0.6b`, ~600 MB downloaded on first run).
+
+**Option A: Docker**
+
+```bash
+cd nemospeech
+docker build -t nemospeech .
+docker run --gpus all -p 5051:5051 -v nemospeech-cache:/root/.cache nemospeech
+```
+
+The `-v nemospeech-cache:/root/.cache` volume caches the model between container restarts.
+
+**Option B: Native Python**
 
 ```bash
 cd nemospeech
 uv sync
-uv run uvicorn server:app --host 0.0.0.0 --port 5051
+uv run python server.py
 ```
-
-The server downloads `nvidia/nemotron-speech-streaming-en-0.6b` on first run (~600MB).
 
 ### 3. Run JustTalk
 
@@ -77,7 +130,7 @@ src/
   audio.rs       -- cpal mic capture, 16kHz mono, WAV encoding via hound
   transcribe.rs  -- HTTP client posting WAV to nemospeech server (ureq multipart)
   overlay.rs     -- SCTK 0.19 + wlr-layer-shell overlay with cosmic-text rendering
-  paste.rs       -- Text injection via wtype
+  paste.rs       -- Text injection (wtype for Wayland, xdotool for XWayland)
 
 nemospeech/
   server.py      -- FastAPI server wrapping NVIDIA NeMo ASR
@@ -110,7 +163,7 @@ nemospeech/
 | Text rendering | cosmic-text + tiny-skia pixel ops |
 | ASR | NVIDIA NeMo (Nemotron 0.6B streaming model) |
 | HTTP client | ureq 3 (multipart) |
-| Text paste | wtype |
+| Text paste | wtype (Wayland) + xdotool (XWayland) + wl-clipboard (backup) |
 | Cursor position | hyprctl |
 
 ## License
