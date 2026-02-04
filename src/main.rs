@@ -8,8 +8,8 @@ use anyhow::Result;
 use clap::Parser;
 use input::KeyEvent;
 use overlay::OverlayCommand;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -116,7 +116,20 @@ async fn main() -> Result<()> {
                         let tmp = tempfile::Builder::new().suffix(".wav").tempfile()?;
                         let wav_path = tmp.path().to_path_buf();
                         audio::AudioCapture::write_wav(&samples, &wav_path)?;
-                        transcriber.transcribe(&wav_path)?
+                        match transcriber.transcribe(&wav_path) {
+                            Ok(text) => text,
+                            Err(e) => {
+                                warn!(error = %e, "final transcription failed");
+                                overlay_handle.send(OverlayCommand::UpdateText(
+                                    "Transcription server unreachable".into(),
+                                ));
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                overlay_handle.send(OverlayCommand::Close);
+                                overlay_handle.join();
+                                state = State::Idle;
+                                continue;
+                            }
+                        }
                     };
 
                     if final_text.is_empty() {
@@ -191,10 +204,10 @@ fn periodic_transcription_loop(
     transcriber: Arc<transcribe::Transcriber>,
     overlay_tx: std::sync::mpsc::Sender<OverlayCommand>,
 ) {
-    let interval = std::time::Duration::from_secs(1);
+    let min_interval = std::time::Duration::from_millis(500);
 
-    // Wait initial 1s before first transcription attempt
-    for _ in 0..10 {
+    // Wait initial 500ms before first transcription attempt
+    for _ in 0..5 {
         if stop.load(Ordering::Relaxed) {
             return;
         }
@@ -202,6 +215,7 @@ fn periodic_transcription_loop(
     }
 
     while !stop.load(Ordering::Relaxed) {
+        let loop_start = std::time::Instant::now();
         let samples = audio_handle.snapshot();
         let duration = samples.len() as f32 / 16_000.0;
 
@@ -233,10 +247,14 @@ fn periodic_transcription_loop(
             }
         }
 
-        // Sleep in small increments so we can check the stop flag
-        let sleep_start = std::time::Instant::now();
-        while sleep_start.elapsed() < interval && !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        // Only sleep if transcription was faster than min_interval
+        let elapsed = loop_start.elapsed();
+        if elapsed < min_interval {
+            let remaining = min_interval - elapsed;
+            let sleep_start = std::time::Instant::now();
+            while sleep_start.elapsed() < remaining && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
     }
 }
