@@ -1,0 +1,5 @@
+/target
+nemospeech/.venv/
+nemospeech/uv.lock
+__pycache__/
+*.pyc

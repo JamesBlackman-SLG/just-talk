@@ -1,0 +1,23 @@
+[package]
+name = "justspeak"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+evdev = "0.12"
+cpal = "0.15"
+hound = "3.5"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tempfile = "3"
+ureq = { version = "3", features = ["multipart"] }
+
+# Wayland overlay
+smithay-client-toolkit = { version = "0.19", features = ["calloop"] }
+wayland-client = "0.31"
+tiny-skia = "0.11"
+cosmic-text = "0.12"
+calloop = "0.13"
