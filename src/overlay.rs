@@ -128,10 +128,8 @@ struct OverlayState {
     fly_start: Instant,
     recording_start: Instant,
     last_cursor_poll: Instant,
-    /// Number of bytes of text that have finished animating (grow-in complete).
-    settled_byte_len: usize,
-    /// When new (unsettled) characters started animating.
-    anim_start: Option<Instant>,
+    /// Per-character animation birth times (indexed by char index).
+    char_birth_times: Vec<Instant>,
     done: bool,
 }
 
@@ -185,8 +183,7 @@ fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>) -> Result<()> {
         fly_start: now,
         recording_start: now,
         last_cursor_poll: now,
-        settled_byte_len: 0,
-        anim_start: None,
+        char_birth_times: Vec::new(),
         done: false,
     };
 
@@ -357,52 +354,27 @@ impl OverlayState {
             match cmd {
                 OverlayCommand::UpdateText(text) => {
                     if self.phase == Phase::Recording && text != self.text {
-                        // Find how many bytes of the new text match what was settled
-                        // by finding the common word-aligned prefix.
-                        let old_words: Vec<&str> = self.text.split_whitespace().collect();
-                        let new_words: Vec<&str> = text.split_whitespace().collect();
-                        let common = old_words.iter().zip(new_words.iter())
+                        let now = Instant::now();
+                        let old_chars: Vec<char> = self.text.chars().collect();
+                        let new_chars: Vec<char> = text.chars().collect();
+
+                        // Character-level common prefix
+                        let common_count = old_chars.iter().zip(new_chars.iter())
                             .take_while(|(a, b)| a == b)
                             .count();
 
-                        // Find the byte offset at the end of the common prefix
-                        let common_byte_end = if common == 0 {
-                            0
-                        } else {
-                            // Find end of the `common`th word in the new text
-                            let mut word_idx = 0;
-                            let mut end = 0;
-                            let mut in_word = false;
-                            for (byte_idx, ch) in text.char_indices() {
-                                if ch.is_whitespace() {
-                                    if in_word {
-                                        word_idx += 1;
-                                        if word_idx >= common {
-                                            end = byte_idx;
-                                            break;
-                                        }
-                                    }
-                                    in_word = false;
-                                } else {
-                                    in_word = true;
-                                }
-                            }
-                            // If we ran out of chars, all words matched
-                            if word_idx < common && in_word {
-                                text.len()
-                            } else {
-                                end
-                            }
-                        };
-
-                        // Settled bytes is the minimum of previous settled and common prefix
-                        self.settled_byte_len = self.settled_byte_len.min(common_byte_end);
-
-                        // Start animation for the new characters
-                        if common_byte_end < text.len() {
-                            self.anim_start = Some(Instant::now());
+                        // Preserve birth times for matching prefix, fresh for new/changed
+                        let mut new_times = Vec::with_capacity(new_chars.len());
+                        for i in 0..common_count {
+                            new_times.push(
+                                self.char_birth_times.get(i).copied().unwrap_or(now),
+                            );
+                        }
+                        for _ in common_count..new_chars.len() {
+                            new_times.push(now);
                         }
 
+                        self.char_birth_times = new_times;
                         self.text = text;
                     }
                 }
@@ -559,7 +531,6 @@ impl OverlayState {
     fn draw_recording(&mut self, qh: &QueueHandle<Self>, width: u32, height: u32) {
         self.poll_cursor();
         let rec_elapsed = self.rec_dot_elapsed();
-        let anim_elapsed = self.anim_start.map(|t| t.elapsed().as_secs_f32());
 
         let stride = width as i32 * 4;
         let buf_size = (stride * height as i32) as usize;
@@ -600,31 +571,27 @@ impl OverlayState {
             draw_rounded_rect(canvas, cw, ch, px, py, pw, ph,
                 PANEL_CORNER_RADIUS, fill, border, BORDER_WIDTH);
 
-            // Collect glyph info for per-character animation
-            let settled = self.settled_byte_len;
-            let mut all_settled = true;
+            // Collect glyph info with per-character birth-time animation
+            let now = Instant::now();
+            let birth_times = &self.char_birth_times;
             let mut glyph_infos: Vec<GlyphDrawInfo> = Vec::new();
 
             for run in text_buf.layout_runs() {
                 for glyph in run.glyphs.iter() {
-                    let is_new = glyph.start >= settled;
-                    let scale = if is_new {
-                        if let Some(elapsed) = anim_elapsed {
-                            // Character index within the new region for stagger
-                            let char_idx = self.text[settled..glyph.start].chars().count();
-                            let delay = char_idx as f32 * CHAR_STAGGER;
-                            let t = ((elapsed - delay) / CHAR_GROW_DURATION).clamp(0.0, 1.0);
-                            if t < 1.0 { all_settled = false; }
-                            // Ease-out for smooth deceleration
-                            let eased = 1.0 - (1.0 - t) * (1.0 - t);
-                            eased
-                        } else {
-                            all_settled = false;
-                            0.0
-                        }
-                    } else {
-                        1.0
-                    };
+                    let char_idx = self.text[..glyph.start].chars().count();
+                    let birth = birth_times.get(char_idx).copied().unwrap_or(now);
+                    let elapsed = now.duration_since(birth).as_secs_f32();
+
+                    // Stagger within batch (chars born at the same instant)
+                    let batch_start = (0..char_idx)
+                        .rev()
+                        .find(|&i| birth_times.get(i).copied() != Some(birth))
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    let stagger_delay = (char_idx - batch_start) as f32 * CHAR_STAGGER;
+
+                    let t = ((elapsed - stagger_delay) / CHAR_GROW_DURATION).clamp(0.0, 1.0);
+                    let scale = 1.0 - (1.0 - t) * (1.0 - t); // ease-out-quad
 
                     glyph_infos.push(GlyphDrawInfo {
                         x: glyph.x + text_ox,
@@ -672,12 +639,6 @@ impl OverlayState {
                     &mut self.font_system, &mut self.swash_cache, &mut char_buf,
                     canvas, cw, ch, ox, oy, alpha,
                 );
-            }
-
-            // If all characters have finished growing, advance settled_byte_len
-            if all_settled && !self.text.is_empty() {
-                self.settled_byte_len = self.text.len();
-                self.anim_start = None;
             }
 
             // Recording dot

@@ -10,6 +10,8 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "python-multipart",
+    "websockets",
+    "numpy",
 ]
 
 [project.scripts]

@@ -27,6 +27,12 @@ impl Transcriber {
         Ok(Self { server_url })
     }
 
+    /// WebSocket URL for streaming transcription.
+    pub fn ws_url(&self) -> String {
+        let base = self.server_url.replace("http://", "ws://").replace("https://", "wss://");
+        format!("{base}/ws/stream")
+    }
+
     /// Transcribe a WAV file by uploading it to the nemospeech server.
     pub fn transcribe(&self, wav_path: &Path) -> Result<String> {
         info!(path = %wav_path.display(), "transcribing via nemospeech");
