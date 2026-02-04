@@ -3,7 +3,7 @@ use cosmic_text::{
     Attrs, Buffer as TextBuffer, Color as CColor, FontSystem, Metrics, Shaping, SwashCache,
 };
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -155,6 +155,12 @@ fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>) -> Result<()> {
     layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
     layer.set_exclusive_zone(-1);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+
+    // Empty input region — overlay is visual only, pointer events pass through
+    // so Hyprland can still change window focus while the overlay is visible.
+    let empty_region = Region::new(&compositor).context("failed to create region")?;
+    layer.wl_surface().set_input_region(Some(empty_region.wl_region()));
+
     layer.commit();
 
     let font_system = FontSystem::new();
