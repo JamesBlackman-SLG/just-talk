@@ -163,6 +163,14 @@ async fn main() -> Result<()> {
                         }
                     };
 
+                    // Check if user cancelled via overlay button
+                    if overlay_handle.was_cancelled() {
+                        info!("transcription cancelled by user");
+                        overlay_handle.join();
+                        state = State::Idle;
+                        continue;
+                    }
+
                     if final_text.is_empty() {
                         warn!("final transcription returned empty text");
                         overlay_handle.send(OverlayCommand::Close);

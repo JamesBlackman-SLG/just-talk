@@ -4,10 +4,15 @@ use cosmic_text::{
 };
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        Capability, SeatHandler, SeatState,
+        pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT},
+    },
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -17,12 +22,13 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 use tracing::{info, warn};
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
 
@@ -67,6 +73,21 @@ const CURSOR_POLL_MS: u128 = 50;
 const CHAR_GROW_DURATION: f32 = 0.25;
 const CHAR_STAGGER: f32 = 0.025;
 
+// Cancel button (inside panel, bottom-right)
+const CANCEL_BTN_WIDTH: u32 = 80;
+const CANCEL_BTN_HEIGHT: u32 = 28;
+const CANCEL_BTN_GAP: f32 = 8.0;
+const CANCEL_BTN_MARGIN: f32 = 12.0;
+const CANCEL_BTN_CORNER_RADIUS: f32 = 10.0;
+const CANCEL_BTN_BG_R: u8 = 0x2A;
+const CANCEL_BTN_BG_G: u8 = 0x2A;
+const CANCEL_BTN_BG_B: u8 = 0x42;
+const CANCEL_BTN_HOVER_R: u8 = 0x5A;
+const CANCEL_BTN_HOVER_G: u8 = 0x28;
+const CANCEL_BTN_HOVER_B: u8 = 0x28;
+const CANCEL_BTN_FONT_SIZE: f32 = 14.0;
+const CANCEL_BTN_LINE_HEIGHT: f32 = 18.0;
+
 // ---- Public API ----
 
 /// Commands sent to the overlay thread.
@@ -80,6 +101,7 @@ pub enum OverlayCommand {
 pub struct OverlayHandle {
     pub tx: mpsc::Sender<OverlayCommand>,
     join: std::thread::JoinHandle<()>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl OverlayHandle {
@@ -89,16 +111,21 @@ impl OverlayHandle {
     pub fn join(self) {
         let _ = self.join.join();
     }
+    pub fn was_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
 }
 
 pub fn spawn_overlay() -> Result<OverlayHandle> {
     let (tx, rx) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_clone = cancelled.clone();
     let join = std::thread::spawn(move || {
-        if let Err(e) = run_overlay_thread(rx) {
+        if let Err(e) = run_overlay_thread(rx, cancelled_clone) {
             warn!(error = %e, "overlay thread failed");
         }
     });
-    Ok(OverlayHandle { tx, join })
+    Ok(OverlayHandle { tx, join, cancelled })
 }
 
 // ---- Private types ----
@@ -112,6 +139,8 @@ enum Phase {
 struct OverlayState {
     registry_state: RegistryState,
     output_state: OutputState,
+    compositor: CompositorState,
+    seat_state: SeatState,
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
@@ -131,11 +160,17 @@ struct OverlayState {
     /// Per-character animation birth times (indexed by char index).
     char_birth_times: Vec<Instant>,
     done: bool,
+    // Pointer / cancel button state
+    pointer: Option<wl_pointer::WlPointer>,
+    cancel_btn_rect: Option<(i32, i32, u32, u32)>,
+    pointer_pos: (f64, f64),
+    pointer_hover: bool,
+    cancelled: Arc<AtomicBool>,
 }
 
 // ---- Overlay thread ----
 
-fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>) -> Result<()> {
+fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>, cancelled: Arc<AtomicBool>) -> Result<()> {
     info!("overlay thread starting");
 
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
@@ -147,6 +182,7 @@ fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>) -> Result<()> {
     let layer_shell =
         LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
+    let seat_state = SeatState::new(&globals, &qh);
 
     let surface = compositor.create_surface(&qh);
     let layer =
@@ -156,8 +192,8 @@ fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>) -> Result<()> {
     layer.set_exclusive_zone(-1);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
-    // Empty input region — overlay is visual only, pointer events pass through
-    // so Hyprland can still change window focus while the overlay is visible.
+    // Start with empty input region — will be updated per-frame to cover
+    // only the cancel button during Recording phase.
     let empty_region = Region::new(&compositor).context("failed to create region")?;
     layer.wl_surface().set_input_region(Some(empty_region.wl_region()));
 
@@ -173,6 +209,8 @@ fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>) -> Result<()> {
     let mut state = OverlayState {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        compositor,
+        seat_state,
         shm,
         pool,
         layer,
@@ -191,6 +229,11 @@ fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>) -> Result<()> {
         last_cursor_poll: now,
         char_birth_times: Vec::new(),
         done: false,
+        pointer: None,
+        cancel_btn_rect: None,
+        pointer_pos: (0.0, 0.0),
+        pointer_hover: false,
+        cancelled,
     };
 
     while !state.done {
@@ -555,6 +598,12 @@ impl OverlayState {
         let fill = premul_argb(PANEL_BG_R, PANEL_BG_G, PANEL_BG_B, PANEL_BG_ALPHA);
         let border = premul_argb(BORDER_R, BORDER_G, BORDER_B, BORDER_ALPHA);
 
+        // Panel bounds — set by either branch, used for cancel button placement
+        let px: i32;
+        let py: i32;
+        let pw: u32;
+        let ph: u32;
+
         if !self.text.is_empty() {
             // Layout at full size to get positions of all glyphs
             let (tw, th, text_buf) = Self::layout_text(
@@ -562,10 +611,11 @@ impl OverlayState {
                 DISPLAY_FONT_SIZE, DISPLAY_LINE_HEIGHT, max_tw, height as f32,
             );
 
-            let pw = (tw + PANEL_PADDING * 2.0).ceil() as u32;
-            let ph = (th + PANEL_PADDING * 2.0).ceil() as u32;
-            let px = (width as f32 / 2.0 - pw as f32 / 2.0) as i32;
-            let py = (height as f32 / 3.0 - ph as f32 / 2.0) as i32;
+            pw = (tw + PANEL_PADDING * 2.0).ceil()
+                .max(CANCEL_BTN_WIDTH as f32 + CANCEL_BTN_MARGIN * 2.0) as u32;
+            ph = (PANEL_PADDING + th + CANCEL_BTN_GAP + CANCEL_BTN_HEIGHT as f32 + CANCEL_BTN_MARGIN).ceil() as u32;
+            px = (width as f32 / 2.0 - pw as f32 / 2.0) as i32;
+            py = (height as f32 / 3.0 - ph as f32 / 2.0) as i32;
             let text_ox = px as f32 + PANEL_PADDING;
             let text_oy = py as f32 + PANEL_PADDING;
 
@@ -653,10 +703,10 @@ impl OverlayState {
                 py as f32 + RECORDING_DOT_MARGIN, rec_elapsed);
         } else {
             // Minimal pill with just the recording dot
-            let pw = (RECORDING_DOT_MARGIN * 2.0 + RECORDING_DOT_RADIUS * 2.0 + PANEL_PADDING) as u32;
-            let ph = (RECORDING_DOT_MARGIN * 2.0) as u32;
-            let px = (width as f32 / 2.0 - pw as f32 / 2.0) as i32;
-            let py = (height as f32 / 3.0 - ph as f32 / 2.0) as i32;
+            pw = (RECORDING_DOT_MARGIN * 2.0 + RECORDING_DOT_RADIUS * 2.0 + PANEL_PADDING) as u32;
+            ph = (RECORDING_DOT_MARGIN * 2.0) as u32;
+            px = (width as f32 / 2.0 - pw as f32 / 2.0) as i32;
+            py = (height as f32 / 3.0 - ph as f32 / 2.0) as i32;
 
             Self::draw_tail(canvas, cw, ch, px, py, pw, ph,
                 self.cursor_x, self.cursor_y, fill, 0xFF);
@@ -669,10 +719,71 @@ impl OverlayState {
                 py as f32 + ph as f32 / 2.0, rec_elapsed);
         }
 
+        // Cancel button — only shown when there's text
+        if self.text.is_empty() {
+            self.cancel_btn_rect = None;
+            self.pointer_hover = false;
+            if let Ok(region) = Region::new(&self.compositor) {
+                self.layer.wl_surface().set_input_region(Some(region.wl_region()));
+            }
+            self.commit_frame(qh, buffer, width, height);
+            return;
+        }
+
+        let btn_x = px + pw as i32 - CANCEL_BTN_MARGIN as i32 - CANCEL_BTN_WIDTH as i32;
+        let btn_y = py + ph as i32 - CANCEL_BTN_MARGIN as i32 - CANCEL_BTN_HEIGHT as i32;
+
+        let btn_fill = if self.pointer_hover {
+            premul_argb(CANCEL_BTN_HOVER_R, CANCEL_BTN_HOVER_G, CANCEL_BTN_HOVER_B, PANEL_BG_ALPHA)
+        } else {
+            premul_argb(CANCEL_BTN_BG_R, CANCEL_BTN_BG_G, CANCEL_BTN_BG_B, PANEL_BG_ALPHA)
+        };
+        draw_rounded_rect(canvas, cw, ch, btn_x, btn_y,
+            CANCEL_BTN_WIDTH, CANCEL_BTN_HEIGHT,
+            CANCEL_BTN_CORNER_RADIUS, btn_fill, border, BORDER_WIDTH);
+
+        // Render "Cancel" text centered in button
+        {
+            let metrics = Metrics::new(CANCEL_BTN_FONT_SIZE, CANCEL_BTN_LINE_HEIGHT);
+            let mut btn_buf = TextBuffer::new(&mut self.font_system, metrics);
+            btn_buf.set_size(&mut self.font_system,
+                Some(CANCEL_BTN_WIDTH as f32), Some(CANCEL_BTN_HEIGHT as f32));
+            btn_buf.set_text(&mut self.font_system, "Cancel",
+                Attrs::new().family(cosmic_text::Family::SansSerif), Shaping::Advanced);
+            btn_buf.shape_until_scroll(&mut self.font_system, false);
+
+            let mut tw = 0.0_f32;
+            for run in btn_buf.layout_runs() {
+                tw = tw.max(run.line_w);
+            }
+            let text_ox = btn_x + ((CANCEL_BTN_WIDTH as f32 - tw) / 2.0) as i32;
+            // Center on font size (not line height) so descender/leading
+            // space doesn't push the visual text above center.
+            let text_oy = btn_y + ((CANCEL_BTN_HEIGHT as f32 - CANCEL_BTN_FONT_SIZE) / 2.0) as i32;
+
+            Self::render_text(
+                &mut self.font_system, &mut self.swash_cache, &mut btn_buf,
+                canvas, cw, ch, text_ox, text_oy, 0xFF,
+            );
+        }
+
+        self.cancel_btn_rect = Some((btn_x, btn_y, CANCEL_BTN_WIDTH, CANCEL_BTN_HEIGHT));
+
+        if let Ok(region) = Region::new(&self.compositor) {
+            region.add(btn_x, btn_y, CANCEL_BTN_WIDTH as i32, CANCEL_BTN_HEIGHT as i32);
+            self.layer.wl_surface().set_input_region(Some(region.wl_region()));
+        }
+
         self.commit_frame(qh, buffer, width, height);
     }
 
     fn draw_flyout(&mut self, qh: &QueueHandle<Self>, width: u32, height: u32) {
+        // Clear cancel button state and set empty input region during fly-out
+        self.cancel_btn_rect = None;
+        self.pointer_hover = false;
+        if let Ok(region) = Region::new(&self.compositor) {
+            self.layer.wl_surface().set_input_region(Some(region.wl_region()));
+        }
         if self.text.is_empty() {
             self.done = true;
             return;
@@ -792,6 +903,17 @@ impl OverlayState {
         );
 
         self.commit_frame(qh, buffer, width, height);
+    }
+
+    fn is_over_cancel_btn(&self, x: f64, y: f64) -> bool {
+        if let Some((bx, by, bw, bh)) = self.cancel_btn_rect {
+            let fx = x as f32;
+            let fy = y as f32;
+            fx >= bx as f32 && fx < (bx as f32 + bw as f32)
+                && fy >= by as f32 && fy < (by as f32 + bh as f32)
+        } else {
+            false
+        }
     }
 
     fn rec_dot_elapsed(&self) -> f32 {
@@ -918,13 +1040,74 @@ impl ShmHandler for OverlayState {
     fn shm_state(&mut self) -> &mut Shm { &mut self.shm }
 }
 
+impl SeatHandler for OverlayState {
+    fn seat_state(&mut self) -> &mut SeatState { &mut self.seat_state }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self, _conn: &Connection, qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat, capability: Capability,
+    ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            if let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
+                self.pointer = Some(ptr);
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self, _: &Connection, _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat, capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(ptr) = self.pointer.take() {
+                ptr.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for OverlayState {
+    fn pointer_frame(
+        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer, events: &[PointerEvent],
+    ) {
+        for event in events {
+            match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    self.pointer_pos = event.position;
+                    self.pointer_hover = self.is_over_cancel_btn(event.position.0, event.position.1);
+                }
+                PointerEventKind::Leave { .. } => {
+                    self.pointer_hover = false;
+                }
+                PointerEventKind::Press { button, .. } => {
+                    if button == BTN_LEFT
+                        && self.is_over_cancel_btn(event.position.0, event.position.1)
+                    {
+                        info!("cancel button clicked");
+                        self.cancelled.store(true, Ordering::Relaxed);
+                        self.done = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 delegate_compositor!(OverlayState);
 delegate_output!(OverlayState);
 delegate_shm!(OverlayState);
 delegate_layer!(OverlayState);
+delegate_seat!(OverlayState);
+delegate_pointer!(OverlayState);
 delegate_registry!(OverlayState);
 
 impl ProvidesRegistryState for OverlayState {
     fn registry(&mut self) -> &mut RegistryState { &mut self.registry_state }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
