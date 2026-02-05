@@ -1,5 +1,6 @@
 mod audio;
 mod input;
+mod midi;
 mod overlay;
 mod paste;
 mod transcribe;
@@ -50,11 +51,12 @@ async fn main() -> Result<()> {
     let audio = audio::AudioCapture::new()?;
     let audio_handle = audio.buffer_handle();
 
-    info!("justspeak ready - hold Right Alt (AltGr) to speak");
+    info!("justspeak ready - hold Right Alt (AltGr) or MIDI foot pedal to speak");
 
-    // Key event channel
+    // Trigger event channel (keyboard and MIDI share the same channel)
     let (tx, mut rx) = mpsc::unbounded_channel();
-    input::spawn_listener(tx)?;
+    input::spawn_listener(tx.clone())?;
+    midi::spawn_listener(tx);
 
     let mut state = State::Idle;
 
