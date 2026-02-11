@@ -1,4 +1,5 @@
 mod audio;
+mod config;
 mod input;
 mod midi;
 mod overlay;

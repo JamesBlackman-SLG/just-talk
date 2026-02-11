@@ -1,9 +1,8 @@
+use crate::config::Config;
 use anyhow::{Context, Result};
 use std::path::Path;
 use tracing::{info, warn};
 use ureq::unversioned::multipart::{Form, Part};
-
-const DEFAULT_SERVER: &str = "http://localhost:5051";
 
 pub struct Transcriber {
     server_url: String,
@@ -11,9 +10,7 @@ pub struct Transcriber {
 
 impl Transcriber {
     pub fn new(server_url: Option<String>) -> Self {
-        let server_url = server_url.unwrap_or_else(|| {
-            std::env::var("NEMOSPEECH_URL").unwrap_or_else(|_| DEFAULT_SERVER.to_string())
-        });
+        let server_url = Config::resolve_server_url(server_url);
 
         // Non-fatal health check — server may not be up yet
         let health_url = format!("{}/health", server_url);
