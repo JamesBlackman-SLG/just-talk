@@ -19,8 +19,9 @@ const BLIP_SAMPLES: usize = 265;
 /// Short words → high pitch, long words → low pitch.
 /// 1 char ≈ 1100 Hz, 5 chars ≈ 900 Hz, 10+ chars ≈ 660 Hz.
 fn freq_for_word_len(len: usize) -> u32 {
+    // Base range raised half an octave: ~1320–1650 Hz
     let len = len.clamp(1, 10) as f32;
-    (1100.0 - (len - 1.0) * 49.0) as u32
+    (1650.0 - (len - 1.0) * 73.0) as u32
 }
 
 /// Keeps a cpal output stream open for the lifetime of a paste.
@@ -84,10 +85,9 @@ impl BlipPlayer {
                                         / (BLIP_SAMPLES * 9 / 10) as f32;
                                     (1.0 - pos) * (1.0 - pos)
                                 };
-                                let wave = (std::f32::consts::TAU * hz * t).sin()
-                                    + 0.35 * (std::f32::consts::TAU * hz * 2.0 * t).sin()
-                                    + 0.15 * (std::f32::consts::TAU * hz * 3.0 * t).sin();
-                                *out = wave * env * 0.15;
+                                let root = (std::f32::consts::TAU * hz * t).sin();
+                                let fifth = (std::f32::consts::TAU * hz * 1.5 * t).sin();
+                                *out = (root + 0.7 * fifth) * env * 0.15;
                             } else {
                                 *out = 0.0;
                             }
