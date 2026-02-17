@@ -8,6 +8,10 @@ const DEFAULT_SERVER: &str = "http://localhost:5051";
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
+
+    /// PipeWire/ALSA sink name for blip audio (e.g. "alsa_output.pci-...").
+    /// If unset, uses the default output device.
+    pub blip_device: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,7 +55,7 @@ impl Config {
             .map(|c| c.join("justspeak/config.toml"))
     }
 
-    fn load() -> Self {
+    pub fn load() -> Self {
         let Some(path) = Self::config_path() else {
             return Self::default();
         };
