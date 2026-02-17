@@ -10,13 +10,29 @@ Single-binary Rust app. Tokio async runtime for the main event loop; blocking th
 
 - `main.rs` — Event loop: Idle/Recording state machine, streaming WebSocket transcription, HTTP fallback
 - `audio.rs` — Microphone capture via `cpal` (16kHz mono f32). `AudioBufferHandle` allows snapshot from other threads
-- `blip.rs` — Synthesizes per-character blip tones (880Hz + harmonics, ~10ms) and plays via `cpal` output. Used during paste for the "Mother from Alien" typing effect
+- `blip.rs` — Synthesizes per-character blip tones (880Hz + harmonics, pitch varies by word length) via `cpal` output. Opt-in: only active when `blip_device` is configured. Routes audio to a specific PipeWire sink via `PIPEWIRE_NODE` env var
 - `input.rs` — Reads `/dev/input/event*` via `evdev` for AltGr press/release. Requires `input` group membership
 - `midi.rs` — Listens for MIDI CC 85 from FS-1-WL foot pedal via `midir`. Maps to same `KeyEvent` as keyboard
 - `overlay.rs` — Wayland layer-shell overlay (smithay-client-toolkit + tiny-skia + cosmic-text). Shows live transcription, cancel button, fly-in animation
-- `paste.rs` — Types text into focused window. Detects XWayland vs native Wayland via `hyprctl`. Uses `xdotool type` or `wtype` with per-character delay synced to blip audio
+- `paste.rs` — Types text into focused window. Detects XWayland vs native Wayland via `hyprctl`. Uses `xdotool type` or `wtype`. With blips enabled: pastes word-by-word, blip audio paces the delay between words. Without: instant bulk paste
 - `transcribe.rs` — HTTP and WebSocket client for nemospeech server (configurable URL)
 - `config.rs` — TOML config from `~/.config/justspeak/config.toml`. Priority: CLI > env `NEMOSPEECH_URL` > config file > default
+
+### Config File
+
+`~/.config/justspeak/config.toml`:
+
+```toml
+# Optional: route blip audio to a specific PipeWire sink.
+# Use PipeWire node name (from `pw-cli list-objects Node`).
+# If omitted, blips are disabled and text pastes instantly.
+blip_device = "alsa_output.pci-0000_0d_00.4.analog-stereo"
+
+[server]
+url = "http://localhost:5051"
+```
+
+The `blip_device` key enables the "Mother from Alien" typing effect — word-by-word paste with synthesized CRT blip tones. Pitch varies by word length (short words = high, long words = low). Without this key, paste is instant and silent.
 
 ### External Dependencies (runtime)
 
