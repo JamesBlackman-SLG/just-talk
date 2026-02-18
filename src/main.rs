@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
                     loop {
                         match rx.recv().await {
                             Some(KeyEvent::AltGrReleased) => break,
-                            Some(KeyEvent::AltGrPressed) => continue, // repeat
+                            Some(KeyEvent::AltGrPressed) | Some(KeyEvent::DoubleTap) => continue,
                             None => return Ok(()),
                         }
                     }
@@ -228,10 +228,17 @@ async fn main() -> Result<()> {
                 state = State::Idle;
             }
 
+            (State::Idle, KeyEvent::DoubleTap) => {
+                let enabled = config::Config::toggle_blips();
+                info!(enabled, "blips toggled");
+                blip::play_toggle_sound(enabled);
+            }
+
             // Ignore spurious events
             (State::Idle, KeyEvent::AltGrReleased) => {}
             (State::Recording, KeyEvent::AltGrPressed) => {} // repeat
             (State::Recording, KeyEvent::AltGrReleased) => {} // handled in overlay branch above
+            (State::Recording, KeyEvent::DoubleTap) => {}    // ignore during recording
         }
     }
 

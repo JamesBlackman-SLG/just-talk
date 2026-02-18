@@ -1,6 +1,7 @@
 use anyhow::Result;
 use evdev::{Device, InputEventKind, Key};
 use std::path::PathBuf;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -8,6 +9,7 @@ use tracing::{debug, info, warn};
 pub enum KeyEvent {
     AltGrPressed,
     AltGrReleased,
+    DoubleTap,
 }
 
 /// Find all keyboard devices in /dev/input/
@@ -52,14 +54,49 @@ pub fn spawn_listener(tx: mpsc::UnboundedSender<KeyEvent>) -> Result<()> {
                 }
             };
             info!(path = %path.display(), "listening for AltGr on device");
+
+            let mut last_press_time: Option<Instant> = None;
+            let mut last_release_time: Option<Instant> = None;
+            let mut suppress_release = false;
+
             loop {
                 match device.fetch_events() {
                     Ok(events) => {
                         for ev in events {
                             if let InputEventKind::Key(Key::KEY_RIGHTALT) = ev.kind() {
                                 let event = match ev.value() {
-                                    1 => Some(KeyEvent::AltGrPressed),
-                                    0 => Some(KeyEvent::AltGrReleased),
+                                    1 => {
+                                        // Press: check for double-tap
+                                        let now = Instant::now();
+                                        let is_double_tap = match (last_press_time, last_release_time) {
+                                            (Some(prev_press), Some(prev_release)) => {
+                                                let prev_tap_duration = prev_release.duration_since(prev_press);
+                                                let gap = now.duration_since(prev_release);
+                                                prev_tap_duration.as_millis() < 300
+                                                    && gap.as_millis() < 400
+                                            }
+                                            _ => false,
+                                        };
+                                        last_press_time = Some(now);
+                                        if is_double_tap {
+                                            suppress_release = true;
+                                            // Clear timing so triple-tap doesn't re-trigger
+                                            last_press_time = None;
+                                            last_release_time = None;
+                                            Some(KeyEvent::DoubleTap)
+                                        } else {
+                                            Some(KeyEvent::AltGrPressed)
+                                        }
+                                    }
+                                    0 => {
+                                        if suppress_release {
+                                            suppress_release = false;
+                                            None
+                                        } else {
+                                            last_release_time = Some(Instant::now());
+                                            Some(KeyEvent::AltGrReleased)
+                                        }
+                                    }
                                     _ => None, // repeat events (value=2) ignored
                                 };
                                 if let Some(event) = event {

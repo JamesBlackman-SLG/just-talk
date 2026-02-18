@@ -11,7 +11,7 @@ Single-binary Rust app. Tokio async runtime for the main event loop; blocking th
 - `main.rs` — Event loop: Idle/Recording state machine, streaming WebSocket transcription, HTTP fallback
 - `audio.rs` — Microphone capture via `cpal` (16kHz mono f32). `AudioBufferHandle` allows snapshot from other threads
 - `blip.rs` — Synthesizes per-character blip tones via `cpal` output. Each blip plays root + perfect fifth (3:2 ratio). Pitch varies by word length: short words ~1650Hz, long words ~990Hz. 18ms per character, ~6ms tone with quadratic decay envelope. Opt-in: only active when `blip_device` is configured. Routes audio to a specific PipeWire sink via `PIPEWIRE_NODE` env var
-- `input.rs` — Reads `/dev/input/event*` via `evdev` for AltGr press/release. Requires `input` group membership
+- `input.rs` — Reads `/dev/input/event*` via `evdev` for AltGr press/release and double-tap detection. Requires `input` group membership
 - `midi.rs` — Listens for MIDI CC 85 from FS-1-WL foot pedal via `midir`. Maps to same `KeyEvent` as keyboard
 - `overlay.rs` — Wayland layer-shell overlay (smithay-client-toolkit + tiny-skia + cosmic-text). Shows live transcription, cancel button, fly-in animation
 - `paste.rs` — Types text into focused window. Detects XWayland vs native Wayland via `hyprctl`. Uses `xdotool type` or `wtype`. With blips enabled: pastes word-by-word, blip audio paces the delay between words. Without: instant bulk paste
@@ -23,6 +23,9 @@ Single-binary Rust app. Tokio async runtime for the main event loop; blocking th
 `~/.config/justspeak/config.toml`:
 
 ```toml
+# Toggle blip sounds on/off (persisted by double-tap AltGr at runtime)
+blips_enabled = true
+
 # Optional: route blip audio to a specific PipeWire sink.
 # Use PipeWire node name (from `pw-cli list-objects Node`).
 # If omitted, blips are disabled and text pastes instantly.
@@ -33,6 +36,8 @@ url = "http://localhost:5051"
 ```
 
 The `blip_device` key enables the "Mother from Alien" typing effect — word-by-word paste with synthesized blip tones. Each blip is a root note + perfect fifth interval. Pitch varies by word length (short words ≈ 1650Hz, long words ≈ 990Hz, 18ms per character). Without this key, paste is instant and silent.
+
+Double-tap AltGr to toggle blips on/off at runtime. Plays a two-note confirmation tone (ascending C5→G5 for ON, descending G5→C5 for OFF). State persists to config file. MIDI pedal does NOT trigger the toggle — keyboard-only.
 
 ### External Dependencies (runtime)
 

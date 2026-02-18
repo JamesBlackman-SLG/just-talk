@@ -23,8 +23,9 @@ pub fn paste_text(text: &str) -> Result<()> {
     let xwayland = is_xwayland_focused();
     info!(len = text.len(), xwayland, "pasting word-by-word with blips");
 
-    // Blips are opt-in: only play when blip_device is configured
-    if crate::config::Config::load().blip_device.is_none() {
+    // Blips are opt-in: only play when blip_device is configured and blips are enabled
+    let config = crate::config::Config::load();
+    if config.blip_device.is_none() || !config.blips_enabled {
         return bulk_paste(text, xwayland);
     }
     let player = match blip::BlipPlayer::new() {

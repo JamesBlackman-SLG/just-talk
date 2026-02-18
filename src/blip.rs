@@ -3,6 +3,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
+use tracing::warn;
 
 const SAMPLE_RATE: u32 = 44_100;
 
@@ -133,4 +134,95 @@ impl BlipPlayer {
             std::thread::sleep(Duration::from_millis(2));
         }
     }
+}
+
+/// Play a two-note confirmation tone for blip toggle.
+/// Ascending (C5→G5) for enabled, descending (G5→C5) for disabled.
+/// ~200ms total. Uses same PIPEWIRE_NODE routing as BlipPlayer.
+pub fn play_toggle_sound(enabled: bool) {
+    std::thread::spawn(move || {
+        if let Err(e) = play_toggle_sound_inner(enabled) {
+            warn!(error = %e, "failed to play toggle sound");
+        }
+    });
+}
+
+fn play_toggle_sound_inner(enabled: bool) -> Result<()> {
+    let app_config = crate::config::Config::load();
+
+    if let Some(ref node) = app_config.blip_device {
+        unsafe { std::env::set_var("PIPEWIRE_NODE", node) };
+    }
+
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .context("no audio output device")?;
+
+    let config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    // C5 ≈ 523 Hz, G5 ≈ 784 Hz
+    let (freq1, freq2): (f32, f32) = if enabled {
+        (523.0, 784.0)
+    } else {
+        (784.0, 523.0)
+    };
+
+    let note_samples = SAMPLE_RATE as usize / 10; // 100ms per note
+    let total_samples = note_samples * 2;
+    let played = Arc::new(AtomicUsize::new(0));
+    let p = played.clone();
+
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let mut i = p.load(Ordering::Relaxed);
+            for out in data.iter_mut() {
+                if i < total_samples {
+                    let (hz, note_pos) = if i < note_samples {
+                        (freq1, i)
+                    } else {
+                        (freq2, i - note_samples)
+                    };
+                    let t = note_pos as f32 / SAMPLE_RATE as f32;
+                    // Envelope: quick attack, quadratic decay
+                    let env = if note_pos < note_samples / 10 {
+                        note_pos as f32 / (note_samples / 10) as f32
+                    } else {
+                        let pos = (note_pos - note_samples / 10) as f32
+                            / (note_samples * 9 / 10) as f32;
+                        (1.0 - pos) * (1.0 - pos)
+                    };
+                    let root = (std::f32::consts::TAU * hz * t).sin();
+                    let fifth = (std::f32::consts::TAU * hz * 1.5 * t).sin();
+                    *out = (root + 0.7 * fifth) * env * 0.15;
+                    i += 1;
+                } else {
+                    *out = 0.0;
+                }
+            }
+            p.store(i, Ordering::Release);
+        },
+        |err| warn!(error = %err, "toggle sound playback error"),
+        None,
+    ).context("failed to build toggle sound stream")?;
+
+    stream.play().context("failed to play toggle sound")?;
+
+    if app_config.blip_device.is_some() {
+        unsafe { std::env::remove_var("PIPEWIRE_NODE") };
+    }
+
+    // Wait for playback to finish
+    while played.load(Ordering::Acquire) < total_samples {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Small tail for audio to flush
+    std::thread::sleep(Duration::from_millis(20));
+
+    Ok(())
 }
