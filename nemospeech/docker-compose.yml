@@ -1,0 +1,19 @@
+services:
+  nemospeech:
+    build: .
+    ports:
+      - "5051:5051"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - nemo-cache:/root/.cache/nemo
+    environment:
+      - NEMOTRON_PORT=5051
+
+volumes:
+  nemo-cache:
