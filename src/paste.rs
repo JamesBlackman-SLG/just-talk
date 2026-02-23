@@ -17,8 +17,9 @@ pub fn paste_text(text: &str) -> Result<()> {
     // Wait for focus to settle after overlay closes
     std::thread::sleep(std::time::Duration::from_millis(150));
 
-    // Always copy to clipboard as a backup
-    let _ = Command::new("wl-copy").arg("--").arg(text).status();
+    // Copy to PRIMARY selection (middle-click paste) as backup
+    // This keeps the CLIPBOARD selection (Ctrl+C/Ctrl+V) untouched
+    let _ = Command::new("wl-copy").arg("--primary").arg("--").arg(text).status();
 
     let xwayland = is_xwayland_focused();
     info!(len = text.len(), xwayland, "pasting word-by-word with blips");
@@ -173,8 +174,9 @@ pub fn check_wtype() -> Result<()> {
         .arg("--help")
         .output()
         .context("wtype not found - install with: pacman -S wtype")?;
+    // wl-copy with --primary for backup clipboard (doesn't affect Ctrl+C/Ctrl+V)
     Command::new("wl-copy")
-        .arg("--help")
+        .args(["--primary", "--help"])
         .output()
         .context("wl-copy not found - install with: pacman -S wl-clipboard")?;
     Command::new("xdotool")
