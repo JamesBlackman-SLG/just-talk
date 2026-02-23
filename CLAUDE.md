@@ -43,7 +43,7 @@ Double-tap AltGr to toggle blips on/off at runtime. Plays a two-note confirmatio
 
 - `wtype` — Virtual keyboard for native Wayland windows
 - `xdotool` — Keystroke injection for XWayland windows
-- `wl-copy` — Clipboard backup
+- `wl-copy` — Backup to PRIMARY selection (middle-click paste; doesn't affect Ctrl+C/Ctrl+V)
 - `hyprctl` — Detect XWayland vs Wayland, cursor position
 
 ### Transcription Server
