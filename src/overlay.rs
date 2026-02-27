@@ -10,8 +10,8 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
-        Capability, SeatHandler, SeatState,
         pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT},
+        Capability, SeatHandler, SeatState,
     },
     shell::{
         wlr_layer::{
@@ -114,6 +114,10 @@ impl OverlayHandle {
     pub fn was_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
+    pub fn close_and_join(self) {
+        self.send(OverlayCommand::Close);
+        self.join();
+    }
 }
 
 pub fn spawn_overlay() -> Result<OverlayHandle> {
@@ -125,7 +129,11 @@ pub fn spawn_overlay() -> Result<OverlayHandle> {
             warn!(error = %e, "overlay thread failed");
         }
     });
-    Ok(OverlayHandle { tx, join, cancelled })
+    Ok(OverlayHandle {
+        tx,
+        join,
+        cancelled,
+    })
 }
 
 // ---- Private types ----
@@ -170,17 +178,18 @@ struct OverlayState {
 
 // ---- Overlay thread ----
 
-fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>, cancelled: Arc<AtomicBool>) -> Result<()> {
+fn run_overlay_thread(
+    rx: mpsc::Receiver<OverlayCommand>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
     info!("overlay thread starting");
 
     let conn = Connection::connect_to_env().context("failed to connect to Wayland")?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
 
-    let compositor =
-        CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
-    let layer_shell =
-        LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available")?;
+    let compositor = CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
+    let layer_shell = LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
     let seat_state = SeatState::new(&globals, &qh);
 
@@ -195,7 +204,9 @@ fn run_overlay_thread(rx: mpsc::Receiver<OverlayCommand>, cancelled: Arc<AtomicB
     // Start with empty input region — will be updated per-frame to cover
     // only the cancel button during Recording phase.
     let empty_region = Region::new(&compositor).context("failed to create region")?;
-    layer.wl_surface().set_input_region(Some(empty_region.wl_region()));
+    layer
+        .wl_surface()
+        .set_input_region(Some(empty_region.wl_region()));
 
     layer.commit();
 
@@ -257,7 +268,10 @@ fn put_pixel(canvas: &mut [u8], cw: usize, ch: usize, px: usize, py: usize, pixe
 
 fn premul_argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
     let a32 = a as u32;
-    (a32 << 24) | (r as u32 * a32 / 255) << 16 | (g as u32 * a32 / 255) << 8 | (b as u32 * a32 / 255)
+    (a32 << 24)
+        | (r as u32 * a32 / 255) << 16
+        | (g as u32 * a32 / 255) << 8
+        | (b as u32 * a32 / 255)
 }
 
 fn draw_circle(canvas: &mut [u8], cw: usize, ch: usize, cx: f32, cy: f32, radius: f32, color: u32) {
@@ -277,9 +291,17 @@ fn draw_circle(canvas: &mut [u8], cw: usize, ch: usize, cx: f32, cy: f32, radius
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_filled_triangle(
-    canvas: &mut [u8], cw: usize, ch: usize,
-    x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32,
+    canvas: &mut [u8],
+    cw: usize,
+    ch: usize,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
     color: u32,
 ) {
     let min_x = x0.min(x1).min(x2).max(0.0) as usize;
@@ -319,10 +341,19 @@ fn corner_center(lx: f32, ly: f32, rw: f32, rh: f32, radius: f32) -> (Option<f32
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_rounded_rect(
-    canvas: &mut [u8], cw: usize, ch: usize,
-    rx: i32, ry: i32, rw: u32, rh: u32,
-    radius: f32, fill: u32, border: u32, bw: f32,
+    canvas: &mut [u8],
+    cw: usize,
+    ch: usize,
+    rx: i32,
+    ry: i32,
+    rw: u32,
+    rh: u32,
+    radius: f32,
+    fill: u32,
+    border: u32,
+    bw: f32,
 ) {
     let x0 = rx.max(0) as usize;
     let y0 = ry.max(0) as usize;
@@ -377,13 +408,10 @@ fn read_cursor_position() -> (f32, f32) {
     if let Ok(output) = std::process::Command::new("hyprctl")
         .args(["cursorpos", "-j"])
         .output()
-    {
-        if let Ok(text) = String::from_utf8(output.stdout) {
-            if let (Some(x), Some(y)) = (json_num(&text, "x"), json_num(&text, "y")) {
+        && let Ok(text) = String::from_utf8(output.stdout)
+            && let (Some(x), Some(y)) = (json_num(&text, "x"), json_num(&text, "y")) {
                 return (x, y);
             }
-        }
-    }
     (960.0, 800.0)
 }
 
@@ -408,16 +436,16 @@ impl OverlayState {
                         let new_chars: Vec<char> = text.chars().collect();
 
                         // Character-level common prefix
-                        let common_count = old_chars.iter().zip(new_chars.iter())
+                        let common_count = old_chars
+                            .iter()
+                            .zip(new_chars.iter())
                             .take_while(|(a, b)| a == b)
                             .count();
 
                         // Preserve birth times for matching prefix, fresh for new/changed
                         let mut new_times = Vec::with_capacity(new_chars.len());
                         for i in 0..common_count {
-                            new_times.push(
-                                self.char_birth_times.get(i).copied().unwrap_or(now),
-                            );
+                            new_times.push(self.char_birth_times.get(i).copied().unwrap_or(now));
                         }
                         for _ in common_count..new_chars.len() {
                             new_times.push(now);
@@ -468,13 +496,22 @@ impl OverlayState {
     }
 
     fn layout_text(
-        fs: &mut FontSystem, text: &str, font_size: f32, line_height: f32,
-        max_w: f32, max_h: f32,
+        fs: &mut FontSystem,
+        text: &str,
+        font_size: f32,
+        line_height: f32,
+        max_w: f32,
+        max_h: f32,
     ) -> (f32, f32, TextBuffer) {
         let metrics = Metrics::new(font_size, line_height);
         let mut buf = TextBuffer::new(fs, metrics);
         buf.set_size(fs, Some(max_w), Some(max_h));
-        buf.set_text(fs, text, Attrs::new().family(cosmic_text::Family::SansSerif), Shaping::Advanced);
+        buf.set_text(
+            fs,
+            text,
+            Attrs::new().family(cosmic_text::Family::SansSerif),
+            Shaping::Advanced,
+        );
         buf.shape_until_scroll(fs, false);
         let mut tw = 0.0_f32;
         let mut th = 0.0_f32;
@@ -485,29 +522,52 @@ impl OverlayState {
         (tw, th, buf)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_text(
-        fs: &mut FontSystem, sc: &mut SwashCache, buf: &mut TextBuffer,
-        canvas: &mut [u8], cw: usize, ch: usize, ox: i32, oy: i32, alpha: u8,
+        fs: &mut FontSystem,
+        sc: &mut SwashCache,
+        buf: &mut TextBuffer,
+        canvas: &mut [u8],
+        cw: usize,
+        ch: usize,
+        ox: i32,
+        oy: i32,
+        alpha: u8,
     ) {
         let color = CColor::rgba(0xFF, 0xFF, 0xFF, alpha);
         buf.draw(fs, sc, color, |x, y, _w, _h, c| {
             let px = x + ox;
             let py = y + oy;
-            if px < 0 || py < 0 { return; }
+            if px < 0 || py < 0 {
+                return;
+            }
             let px = px as usize;
             let py = py as usize;
-            if px >= cw || py >= ch { return; }
+            if px >= cw || py >= ch {
+                return;
+            }
             let a = c.a();
-            if a == 0 { return; }
+            if a == 0 {
+                return;
+            }
             put_pixel(canvas, cw, ch, px, py, premul_argb(c.r(), c.g(), c.b(), a));
         });
     }
 
     /// Draw the speech bubble tail from the nearest panel edge to the cursor.
+    #[allow(clippy::too_many_arguments)]
     fn draw_tail(
-        canvas: &mut [u8], cw: usize, ch: usize,
-        panel_x: i32, panel_y: i32, panel_w: u32, panel_h: u32,
-        cursor_x: f32, cursor_y: f32, fill: u32, alpha: u8,
+        canvas: &mut [u8],
+        cw: usize,
+        ch: usize,
+        panel_x: i32,
+        panel_y: i32,
+        panel_w: u32,
+        panel_h: u32,
+        cursor_x: f32,
+        cursor_y: f32,
+        fill: u32,
+        alpha: u8,
     ) {
         let pl = panel_x as f32;
         let pt = panel_y as f32;
@@ -537,28 +597,36 @@ impl OverlayState {
             // Cursor below — base on bottom edge, spread horizontally
             let h_left = pl + margin;
             let h_right = pr - margin;
-            if h_left >= h_right { return; }
+            if h_left >= h_right {
+                return;
+            }
             let base_cx = cursor_x.clamp(h_left, h_right);
             (base_cx - TAIL_HALF_BASE, pb, base_cx + TAIL_HALF_BASE, pb)
         } else if max_dist == dist_top {
             // Cursor above — base on top edge, spread horizontally
             let h_left = pl + margin;
             let h_right = pr - margin;
-            if h_left >= h_right { return; }
+            if h_left >= h_right {
+                return;
+            }
             let base_cx = cursor_x.clamp(h_left, h_right);
             (base_cx - TAIL_HALF_BASE, pt, base_cx + TAIL_HALF_BASE, pt)
         } else if max_dist == dist_right {
             // Cursor to the right — base on right edge, spread vertically
             let v_top = pt + margin;
             let v_bot = pb - margin;
-            if v_top >= v_bot { return; }
+            if v_top >= v_bot {
+                return;
+            }
             let base_cy = cursor_y.clamp(v_top, v_bot);
             (pr, base_cy - TAIL_HALF_BASE, pr, base_cy + TAIL_HALF_BASE)
         } else {
             // Cursor to the left — base on left edge, spread vertically
             let v_top = pt + margin;
             let v_bot = pb - margin;
-            if v_top >= v_bot { return; }
+            if v_top >= v_bot {
+                return;
+            }
             let base_cy = cursor_y.clamp(v_top, v_bot);
             (pl, base_cy - TAIL_HALF_BASE, pl, base_cy + TAIL_HALF_BASE)
         };
@@ -570,10 +638,34 @@ impl OverlayState {
         draw_filled_triangle(canvas, cw, ch, bx0, by0, bx1, by1, cursor_x, cursor_y, fill);
 
         if alpha > 0 {
-            let border_col = premul_argb(BORDER_R, BORDER_G, BORDER_B,
-                (BORDER_ALPHA as u32 * alpha as u32 / 255) as u8);
-            draw_line(canvas, cw, ch, bx0, by0, cursor_x, cursor_y, BORDER_WIDTH, border_col);
-            draw_line(canvas, cw, ch, bx1, by1, cursor_x, cursor_y, BORDER_WIDTH, border_col);
+            let border_col = premul_argb(
+                BORDER_R,
+                BORDER_G,
+                BORDER_B,
+                (BORDER_ALPHA as u32 * alpha as u32 / 255) as u8,
+            );
+            draw_line(
+                canvas,
+                cw,
+                ch,
+                bx0,
+                by0,
+                cursor_x,
+                cursor_y,
+                BORDER_WIDTH,
+                border_col,
+            );
+            draw_line(
+                canvas,
+                cw,
+                ch,
+                bx1,
+                by1,
+                cursor_x,
+                cursor_y,
+                BORDER_WIDTH,
+                border_col,
+            );
         }
     }
 
@@ -587,8 +679,14 @@ impl OverlayState {
             self.pool.resize(buf_size).ok();
         }
 
-        let (buffer, canvas) = self.pool
-            .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(
+                width as i32,
+                height as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+            )
             .expect("create buffer");
         canvas.fill(0);
 
@@ -607,25 +705,57 @@ impl OverlayState {
         if !self.text.is_empty() {
             // Layout at full size to get positions of all glyphs
             let (tw, th, text_buf) = Self::layout_text(
-                &mut self.font_system, &self.text,
-                DISPLAY_FONT_SIZE, DISPLAY_LINE_HEIGHT, max_tw, height as f32,
+                &mut self.font_system,
+                &self.text,
+                DISPLAY_FONT_SIZE,
+                DISPLAY_LINE_HEIGHT,
+                max_tw,
+                height as f32,
             );
 
-            pw = (tw + PANEL_PADDING * 2.0).ceil()
+            pw = (tw + PANEL_PADDING * 2.0)
+                .ceil()
                 .max(CANCEL_BTN_WIDTH as f32 + CANCEL_BTN_MARGIN * 2.0) as u32;
-            ph = (PANEL_PADDING + th + CANCEL_BTN_GAP + CANCEL_BTN_HEIGHT as f32 + CANCEL_BTN_MARGIN).ceil() as u32;
+            ph = (PANEL_PADDING
+                + th
+                + CANCEL_BTN_GAP
+                + CANCEL_BTN_HEIGHT as f32
+                + CANCEL_BTN_MARGIN)
+                .ceil() as u32;
             px = (width as f32 / 2.0 - pw as f32 / 2.0) as i32;
             py = (height as f32 / 3.0 - ph as f32 / 2.0) as i32;
             let text_ox = px as f32 + PANEL_PADDING;
             let text_oy = py as f32 + PANEL_PADDING;
 
             // Draw tail
-            Self::draw_tail(canvas, cw, ch, px, py, pw, ph,
-                self.cursor_x, self.cursor_y, fill, 0xFF);
+            Self::draw_tail(
+                canvas,
+                cw,
+                ch,
+                px,
+                py,
+                pw,
+                ph,
+                self.cursor_x,
+                self.cursor_y,
+                fill,
+                0xFF,
+            );
 
             // Draw panel
-            draw_rounded_rect(canvas, cw, ch, px, py, pw, ph,
-                PANEL_CORNER_RADIUS, fill, border, BORDER_WIDTH);
+            draw_rounded_rect(
+                canvas,
+                cw,
+                ch,
+                px,
+                py,
+                pw,
+                ph,
+                PANEL_CORNER_RADIUS,
+                fill,
+                border,
+                BORDER_WIDTH,
+            );
 
             // Collect glyph info with per-character birth-time animation
             let now = Instant::now();
@@ -678,9 +808,17 @@ impl OverlayState {
                 // Layout this single character
                 let metrics = Metrics::new(font_size, line_height);
                 let mut char_buf = TextBuffer::new(&mut self.font_system, metrics);
-                char_buf.set_size(&mut self.font_system, Some(info.w + 20.0), Some(DISPLAY_LINE_HEIGHT + 20.0));
-                char_buf.set_text(&mut self.font_system, char_text,
-                    Attrs::new().family(cosmic_text::Family::SansSerif), Shaping::Advanced);
+                char_buf.set_size(
+                    &mut self.font_system,
+                    Some(info.w + 20.0),
+                    Some(DISPLAY_LINE_HEIGHT + 20.0),
+                );
+                char_buf.set_text(
+                    &mut self.font_system,
+                    char_text,
+                    Attrs::new().family(cosmic_text::Family::SansSerif),
+                    Shaping::Advanced,
+                );
                 char_buf.shape_until_scroll(&mut self.font_system, false);
 
                 // Position: center the scaled character on where it should be at full size
@@ -692,15 +830,27 @@ impl OverlayState {
 
                 let alpha = (info.scale * 255.0) as u8;
                 Self::render_text(
-                    &mut self.font_system, &mut self.swash_cache, &mut char_buf,
-                    canvas, cw, ch, ox, oy, alpha,
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                    &mut char_buf,
+                    canvas,
+                    cw,
+                    ch,
+                    ox,
+                    oy,
+                    alpha,
                 );
             }
 
             // Recording dot
-            draw_rec_dot(canvas, cw, ch,
+            draw_rec_dot(
+                canvas,
+                cw,
+                ch,
                 (px + pw as i32) as f32 - RECORDING_DOT_MARGIN,
-                py as f32 + RECORDING_DOT_MARGIN, rec_elapsed);
+                py as f32 + RECORDING_DOT_MARGIN,
+                rec_elapsed,
+            );
         } else {
             // Minimal pill with just the recording dot
             pw = (RECORDING_DOT_MARGIN * 2.0 + RECORDING_DOT_RADIUS * 2.0 + PANEL_PADDING) as u32;
@@ -708,15 +858,42 @@ impl OverlayState {
             px = (width as f32 / 2.0 - pw as f32 / 2.0) as i32;
             py = (height as f32 / 3.0 - ph as f32 / 2.0) as i32;
 
-            Self::draw_tail(canvas, cw, ch, px, py, pw, ph,
-                self.cursor_x, self.cursor_y, fill, 0xFF);
+            Self::draw_tail(
+                canvas,
+                cw,
+                ch,
+                px,
+                py,
+                pw,
+                ph,
+                self.cursor_x,
+                self.cursor_y,
+                fill,
+                0xFF,
+            );
 
-            draw_rounded_rect(canvas, cw, ch, px, py, pw, ph,
-                (ph as f32 / 2.0).min(PANEL_CORNER_RADIUS), fill, border, BORDER_WIDTH);
+            draw_rounded_rect(
+                canvas,
+                cw,
+                ch,
+                px,
+                py,
+                pw,
+                ph,
+                (ph as f32 / 2.0).min(PANEL_CORNER_RADIUS),
+                fill,
+                border,
+                BORDER_WIDTH,
+            );
 
-            draw_rec_dot(canvas, cw, ch,
+            draw_rec_dot(
+                canvas,
+                cw,
+                ch,
                 width as f32 / 2.0,
-                py as f32 + ph as f32 / 2.0, rec_elapsed);
+                py as f32 + ph as f32 / 2.0,
+                rec_elapsed,
+            );
         }
 
         // Cancel button — only shown when there's text
@@ -724,7 +901,9 @@ impl OverlayState {
             self.cancel_btn_rect = None;
             self.pointer_hover = false;
             if let Ok(region) = Region::new(&self.compositor) {
-                self.layer.wl_surface().set_input_region(Some(region.wl_region()));
+                self.layer
+                    .wl_surface()
+                    .set_input_region(Some(region.wl_region()));
             }
             self.commit_frame(qh, buffer, width, height);
             return;
@@ -734,22 +913,49 @@ impl OverlayState {
         let btn_y = py + ph as i32 - CANCEL_BTN_MARGIN as i32 - CANCEL_BTN_HEIGHT as i32;
 
         let btn_fill = if self.pointer_hover {
-            premul_argb(CANCEL_BTN_HOVER_R, CANCEL_BTN_HOVER_G, CANCEL_BTN_HOVER_B, PANEL_BG_ALPHA)
+            premul_argb(
+                CANCEL_BTN_HOVER_R,
+                CANCEL_BTN_HOVER_G,
+                CANCEL_BTN_HOVER_B,
+                PANEL_BG_ALPHA,
+            )
         } else {
-            premul_argb(CANCEL_BTN_BG_R, CANCEL_BTN_BG_G, CANCEL_BTN_BG_B, PANEL_BG_ALPHA)
+            premul_argb(
+                CANCEL_BTN_BG_R,
+                CANCEL_BTN_BG_G,
+                CANCEL_BTN_BG_B,
+                PANEL_BG_ALPHA,
+            )
         };
-        draw_rounded_rect(canvas, cw, ch, btn_x, btn_y,
-            CANCEL_BTN_WIDTH, CANCEL_BTN_HEIGHT,
-            CANCEL_BTN_CORNER_RADIUS, btn_fill, border, BORDER_WIDTH);
+        draw_rounded_rect(
+            canvas,
+            cw,
+            ch,
+            btn_x,
+            btn_y,
+            CANCEL_BTN_WIDTH,
+            CANCEL_BTN_HEIGHT,
+            CANCEL_BTN_CORNER_RADIUS,
+            btn_fill,
+            border,
+            BORDER_WIDTH,
+        );
 
         // Render "Cancel" text centered in button
         {
             let metrics = Metrics::new(CANCEL_BTN_FONT_SIZE, CANCEL_BTN_LINE_HEIGHT);
             let mut btn_buf = TextBuffer::new(&mut self.font_system, metrics);
-            btn_buf.set_size(&mut self.font_system,
-                Some(CANCEL_BTN_WIDTH as f32), Some(CANCEL_BTN_HEIGHT as f32));
-            btn_buf.set_text(&mut self.font_system, "Cancel",
-                Attrs::new().family(cosmic_text::Family::SansSerif), Shaping::Advanced);
+            btn_buf.set_size(
+                &mut self.font_system,
+                Some(CANCEL_BTN_WIDTH as f32),
+                Some(CANCEL_BTN_HEIGHT as f32),
+            );
+            btn_buf.set_text(
+                &mut self.font_system,
+                "Cancel",
+                Attrs::new().family(cosmic_text::Family::SansSerif),
+                Shaping::Advanced,
+            );
             btn_buf.shape_until_scroll(&mut self.font_system, false);
 
             let mut tw = 0.0_f32;
@@ -762,16 +968,30 @@ impl OverlayState {
             let text_oy = btn_y + ((CANCEL_BTN_HEIGHT as f32 - CANCEL_BTN_FONT_SIZE) / 2.0) as i32;
 
             Self::render_text(
-                &mut self.font_system, &mut self.swash_cache, &mut btn_buf,
-                canvas, cw, ch, text_ox, text_oy, 0xFF,
+                &mut self.font_system,
+                &mut self.swash_cache,
+                &mut btn_buf,
+                canvas,
+                cw,
+                ch,
+                text_ox,
+                text_oy,
+                0xFF,
             );
         }
 
         self.cancel_btn_rect = Some((btn_x, btn_y, CANCEL_BTN_WIDTH, CANCEL_BTN_HEIGHT));
 
         if let Ok(region) = Region::new(&self.compositor) {
-            region.add(btn_x, btn_y, CANCEL_BTN_WIDTH as i32, CANCEL_BTN_HEIGHT as i32);
-            self.layer.wl_surface().set_input_region(Some(region.wl_region()));
+            region.add(
+                btn_x,
+                btn_y,
+                CANCEL_BTN_WIDTH as i32,
+                CANCEL_BTN_HEIGHT as i32,
+            );
+            self.layer
+                .wl_surface()
+                .set_input_region(Some(region.wl_region()));
         }
 
         self.commit_frame(qh, buffer, width, height);
@@ -782,7 +1002,9 @@ impl OverlayState {
         self.cancel_btn_rect = None;
         self.pointer_hover = false;
         if let Ok(region) = Region::new(&self.compositor) {
-            self.layer.wl_surface().set_input_region(Some(region.wl_region()));
+            self.layer
+                .wl_surface()
+                .set_input_region(Some(region.wl_region()));
         }
         if self.text.is_empty() {
             self.done = true;
@@ -840,8 +1062,12 @@ impl OverlayState {
 
         let max_tw = (width as f32 * 0.8).max(200.0);
         let (tw, th, mut text_buf) = Self::layout_text(
-            &mut self.font_system, &self.text,
-            font_size, line_height, max_tw, height as f32,
+            &mut self.font_system,
+            &self.text,
+            font_size,
+            line_height,
+            max_tw,
+            height as f32,
         );
 
         let pw = (tw + padding * 2.0).ceil() as u32;
@@ -855,8 +1081,14 @@ impl OverlayState {
             self.pool.resize(buf_size).ok();
         }
 
-        let (buffer, canvas) = self.pool
-            .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(
+                width as i32,
+                height as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+            )
             .expect("create buffer");
         canvas.fill(0);
 
@@ -866,7 +1098,9 @@ impl OverlayState {
         // Draw comet trail dots along the bezier behind the panel
         for i in 1..=TRAIL_COUNT {
             let trail_t = (eased - i as f32 * TRAIL_SPACING).max(0.0);
-            if trail_t <= 0.0 { continue; }
+            if trail_t <= 0.0 {
+                continue;
+            }
 
             let mut tx = bezier(trail_t, start_x, ctrl_x, end_x);
             let mut ty = bezier(trail_t, start_y, ctrl_y, end_y);
@@ -885,7 +1119,15 @@ impl OverlayState {
             let fade = 1.0 - i as f32 / (TRAIL_COUNT as f32 + 1.0);
             let ta = (alpha as f32 * fade * 0.5) as u8;
             let tr = (4.0 - i as f32 * 0.3).max(1.5);
-            draw_circle(canvas, cw, ch, tx, ty, tr, premul_argb(0xAA, 0xBB, 0xFF, ta));
+            draw_circle(
+                canvas,
+                cw,
+                ch,
+                tx,
+                ty,
+                tr,
+                premul_argb(0xAA, 0xBB, 0xFF, ta),
+            );
         }
 
         // Draw panel
@@ -893,13 +1135,31 @@ impl OverlayState {
         let bd_a = (BORDER_ALPHA as u32 * alpha as u32 / 255) as u8;
         let fill = premul_argb(PANEL_BG_R, PANEL_BG_G, PANEL_BG_B, bg_a);
         let bdr = premul_argb(BORDER_R, BORDER_G, BORDER_B, bd_a);
-        draw_rounded_rect(canvas, cw, ch, panel_x, panel_y, pw, ph, corner_r, fill, bdr, BORDER_WIDTH);
+        draw_rounded_rect(
+            canvas,
+            cw,
+            ch,
+            panel_x,
+            panel_y,
+            pw,
+            ph,
+            corner_r,
+            fill,
+            bdr,
+            BORDER_WIDTH,
+        );
 
         // Text
         Self::render_text(
-            &mut self.font_system, &mut self.swash_cache, &mut text_buf,
-            canvas, cw, ch,
-            panel_x + padding as i32, panel_y + padding as i32, alpha,
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &mut text_buf,
+            canvas,
+            cw,
+            ch,
+            panel_x + padding as i32,
+            panel_y + padding as i32,
+            alpha,
         );
 
         self.commit_frame(qh, buffer, width, height);
@@ -909,8 +1169,10 @@ impl OverlayState {
         if let Some((bx, by, bw, bh)) = self.cancel_btn_rect {
             let fx = x as f32;
             let fy = y as f32;
-            fx >= bx as f32 && fx < (bx as f32 + bw as f32)
-                && fy >= by as f32 && fy < (by as f32 + bh as f32)
+            fx >= bx as f32
+                && fx < (bx as f32 + bw as f32)
+                && fy >= by as f32
+                && fy < (by as f32 + bh as f32)
         } else {
             false
         }
@@ -921,13 +1183,21 @@ impl OverlayState {
     }
 
     fn commit_frame(
-        &self, qh: &QueueHandle<Self>,
+        &self,
+        qh: &QueueHandle<Self>,
         buffer: smithay_client_toolkit::shm::slot::Buffer,
-        width: u32, height: u32,
+        width: u32,
+        height: u32,
     ) {
-        self.layer.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
-        self.layer.wl_surface().frame(qh, self.layer.wl_surface().clone());
-        buffer.attach_to(self.layer.wl_surface()).expect("buffer attach");
+        self.layer
+            .wl_surface()
+            .damage_buffer(0, 0, width as i32, height as i32);
+        self.layer
+            .wl_surface()
+            .frame(qh, self.layer.wl_surface().clone());
+        buffer
+            .attach_to(self.layer.wl_surface())
+            .expect("buffer attach");
         self.layer.commit();
     }
 }
@@ -936,7 +1206,15 @@ impl OverlayState {
 fn draw_rec_dot(canvas: &mut [u8], cw: usize, ch: usize, cx: f32, cy: f32, elapsed: f32) {
     let pulse = ((elapsed * 3.0).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
     let a = (100.0 + pulse * 155.0) as u8;
-    draw_circle(canvas, cw, ch, cx, cy, RECORDING_DOT_RADIUS, premul_argb(0xFF, 0x30, 0x30, a));
+    draw_circle(
+        canvas,
+        cw,
+        ch,
+        cx,
+        cy,
+        RECORDING_DOT_RADIUS,
+        premul_argb(0xFF, 0x30, 0x30, a),
+    );
 }
 
 /// Info about a glyph's position and animation scale for per-character grow.
@@ -950,10 +1228,17 @@ struct GlyphDrawInfo {
 }
 
 /// Draw a thick line between two points.
+#[allow(clippy::too_many_arguments)]
 fn draw_line(
-    canvas: &mut [u8], cw: usize, ch: usize,
-    x0: f32, y0: f32, x1: f32, y1: f32,
-    thickness: f32, color: u32,
+    canvas: &mut [u8],
+    cw: usize,
+    ch: usize,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    thickness: f32,
+    color: u32,
 ) {
     let min_x = x0.min(x1).max(0.0) as usize;
     let max_x = (x0.max(x1) as usize + 1).min(cw);
@@ -986,31 +1271,52 @@ fn draw_line(
 
 impl CompositorHandler for OverlayState {
     fn scale_factor_changed(
-        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface, _new_factor: i32,
-    ) {}
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _new_factor: i32,
+    ) {
+    }
     fn transform_changed(
-        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface, _new_transform: wl_output::Transform,
-    ) {}
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _new_transform: wl_output::Transform,
+    ) {
+    }
     fn frame(
-        &mut self, _conn: &Connection, qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface, _time: u32,
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _time: u32,
     ) {
         self.draw(qh);
     }
     fn surface_enter(
-        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface, _output: &wl_output::WlOutput,
-    ) {}
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
+    }
     fn surface_leave(
-        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface, _output: &wl_output::WlOutput,
-    ) {}
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl OutputHandler for OverlayState {
-    fn output_state(&mut self) -> &mut OutputState { &mut self.output_state }
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
@@ -1021,8 +1327,12 @@ impl LayerShellHandler for OverlayState {
         self.done = true;
     }
     fn configure(
-        &mut self, _conn: &Connection, qh: &QueueHandle<Self>, _layer: &LayerSurface,
-        configure: LayerSurfaceConfigure, _serial: u32,
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _layer: &LayerSurface,
+        configure: LayerSurfaceConfigure,
+        _serial: u32,
     ) {
         if configure.new_size.0 != 0 && configure.new_size.1 != 0 {
             self.width = configure.new_size.0;
@@ -1037,34 +1347,42 @@ impl LayerShellHandler for OverlayState {
 }
 
 impl ShmHandler for OverlayState {
-    fn shm_state(&mut self) -> &mut Shm { &mut self.shm }
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
 }
 
 impl SeatHandler for OverlayState {
-    fn seat_state(&mut self) -> &mut SeatState { &mut self.seat_state }
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
 
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 
     fn new_capability(
-        &mut self, _conn: &Connection, qh: &QueueHandle<Self>,
-        seat: wl_seat::WlSeat, capability: Capability,
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
     ) {
-        if capability == Capability::Pointer && self.pointer.is_none() {
-            if let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
+        if capability == Capability::Pointer && self.pointer.is_none()
+            && let Ok(ptr) = self.seat_state.get_pointer(qh, &seat) {
                 self.pointer = Some(ptr);
             }
-        }
     }
 
     fn remove_capability(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat, capability: Capability,
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
     ) {
-        if capability == Capability::Pointer {
-            if let Some(ptr) = self.pointer.take() {
+        if capability == Capability::Pointer
+            && let Some(ptr) = self.pointer.take() {
                 ptr.release();
             }
-        }
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
@@ -1072,14 +1390,18 @@ impl SeatHandler for OverlayState {
 
 impl PointerHandler for OverlayState {
     fn pointer_frame(
-        &mut self, _conn: &Connection, _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer, events: &[PointerEvent],
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
     ) {
         for event in events {
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     self.pointer_pos = event.position;
-                    self.pointer_hover = self.is_over_cancel_btn(event.position.0, event.position.1);
+                    self.pointer_hover =
+                        self.is_over_cancel_btn(event.position.0, event.position.1);
                 }
                 PointerEventKind::Leave { .. } => {
                     self.pointer_hover = false;
@@ -1108,6 +1430,8 @@ delegate_pointer!(OverlayState);
 delegate_registry!(OverlayState);
 
 impl ProvidesRegistryState for OverlayState {
-    fn registry(&mut self) -> &mut RegistryState { &mut self.registry_state }
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
     registry_handlers![OutputState, SeatState];
 }

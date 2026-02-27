@@ -1,29 +1,47 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
 const DEFAULT_SERVER: &str = "http://localhost:5051";
 
-#[derive(Debug, Deserialize, Default)]
+static CONFIG_RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
 
-    /// PipeWire/ALSA sink name for blip audio (e.g. "alsa_output.pci-...").
-    /// If unset, uses the default output device.
+    #[serde(default)]
     pub blip_device: Option<String>,
 
-    /// Whether blip sounds are enabled (toggled at runtime via double-tap AltGr).
-    /// Defaults to true. Only meaningful when blip_device is set.
     #[serde(default = "default_true")]
     pub blips_enabled: bool,
+
+    #[serde(default)]
+    pub midi_cc: Option<u8>,
+
+    #[serde(default)]
+    pub input_device: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            blip_device: None,
+            blips_enabled: true,
+            midi_cc: None,
+            input_device: None,
+        }
+    }
 }
 
 fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
     #[serde(default = "default_server_url")]
     pub url: String,
@@ -42,7 +60,6 @@ fn default_server_url() -> String {
 }
 
 impl Config {
-    /// Load config with priority: CLI arg > env var > config file > default.
     pub fn resolve_server_url(cli_server: Option<String>) -> String {
         if let Some(url) = cli_server {
             return url;
@@ -92,38 +109,25 @@ impl Config {
         }
     }
 
-    /// Toggle `blips_enabled` in the config file and return the new value.
-    /// Uses targeted string manipulation — no TOML serializer needed.
     pub fn toggle_blips() -> bool {
-        let current = Self::load();
-        let new_value = !current.blips_enabled;
+        let mut current = Self::load();
+        current.blips_enabled = !current.blips_enabled;
+        let new_value = current.blips_enabled;
 
         let Some(path) = Self::config_path() else {
             warn!("cannot determine config path, toggle not persisted");
             return new_value;
         };
 
-        // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let contents = std::fs::read_to_string(&path).unwrap_or_default();
-        let new_line = format!("blips_enabled = {new_value}");
-
-        let new_contents = if let Some(start) = contents.find("blips_enabled") {
-            // Find the end of the line
-            let line_end = contents[start..]
-                .find('\n')
-                .map(|i| start + i)
-                .unwrap_or(contents.len());
-            format!("{}{}{}", &contents[..start], new_line, &contents[line_end..])
-        } else {
-            // Insert at the top (before [server] or other sections)
-            if contents.is_empty() {
-                new_line + "\n"
-            } else {
-                format!("{new_line}\n{contents}")
+        let new_contents = match toml::to_string_pretty(&current) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize config");
+                return new_value;
             }
         };
 
@@ -133,5 +137,63 @@ impl Config {
         }
 
         new_value
+    }
+
+    pub fn request_reload() {
+        CONFIG_RELOAD_REQUESTED.store(true, Ordering::Relaxed);
+    }
+
+    pub fn reload_if_requested() -> bool {
+        if CONFIG_RELOAD_REQUESTED.load(Ordering::Relaxed) {
+            CONFIG_RELOAD_REQUESTED.store(false, Ordering::Relaxed);
+            info!("config reloaded via SIGHUP");
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_values() {
+        let config = Config::default();
+        assert_eq!(config.server.url, "http://localhost:5051");
+        assert!(config.blips_enabled);
+        assert!(config.blip_device.is_none());
+        assert!(config.midi_cc.is_none());
+    }
+
+    #[test]
+    fn test_config_deserialization() {
+        let toml = r#"blip_device = "my-sink"
+blips_enabled = false
+midi_cc = 65
+input_device = "my-mic"
+
+[server]
+url = "http://localhost:9090"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.url, "http://localhost:9090");
+        assert_eq!(config.blip_device, Some("my-sink".to_string()));
+        assert!(!config.blips_enabled);
+        assert_eq!(config.midi_cc, Some(65));
+        assert_eq!(config.input_device, Some("my-mic".to_string()));
+    }
+
+    #[test]
+    fn test_config_partial_deserialization() {
+        let toml = r#"
+            [server]
+            url = "http://custom:1234"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.url, "http://custom:1234");
+        assert!(config.blips_enabled);
     }
 }

@@ -19,10 +19,17 @@ pub fn paste_text(text: &str) -> Result<()> {
 
     // Copy to PRIMARY selection (middle-click paste) as backup
     // This keeps the CLIPBOARD selection (Ctrl+C/Ctrl+V) untouched
-    let _ = Command::new("wl-copy").arg("--primary").arg("--").arg(text).status();
+    let _ = Command::new("wl-copy")
+        .arg("--primary")
+        .arg("--")
+        .arg(text)
+        .status();
 
     let xwayland = is_xwayland_focused();
-    info!(len = text.len(), xwayland, "pasting word-by-word with blips");
+    info!(
+        len = text.len(),
+        xwayland, "pasting word-by-word with blips"
+    );
 
     // Blips are opt-in: only play when blip_device is configured and blips are enabled
     let config = crate::config::Config::load();
@@ -73,9 +80,7 @@ fn word_chunks(text: &str) -> Vec<&str> {
         // After a whitespace char, if the next char is non-whitespace (or end),
         // that's a chunk boundary
         let at_end = chars.peek().is_none();
-        let next_is_word = chars
-            .peek()
-            .is_some_and(|&(_, next)| !next.is_whitespace());
+        let next_is_word = chars.peek().is_some_and(|&(_, next)| !next.is_whitespace());
 
         if ch.is_whitespace() && (next_is_word || at_end) {
             let end = chars.peek().map_or(text.len(), |&(idx, _)| idx);
@@ -92,6 +97,44 @@ fn word_chunks(text: &str) -> Vec<&str> {
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_word_chunks_basic() {
+        assert_eq!(word_chunks("hello world"), vec!["hello ", "world"]);
+    }
+
+    #[test]
+    fn test_word_chunks_with_punctuation() {
+        assert_eq!(
+            word_chunks("Hello, world!\nHow are you?"),
+            vec!["Hello, ", "world!\n", "How ", "are ", "you?"]
+        );
+    }
+
+    #[test]
+    fn test_word_chunks_single_word() {
+        assert_eq!(word_chunks("hello"), vec!["hello"]);
+    }
+
+    #[test]
+    fn test_word_chunks_with_leading_whitespace() {
+        assert_eq!(word_chunks("  hello"), vec!["  ", "hello"]);
+    }
+
+    #[test]
+    fn test_word_chunks_empty() {
+        assert_eq!(word_chunks(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn test_word_chunks_only_whitespace() {
+        assert_eq!(word_chunks("   "), vec!["   "]);
+    }
 }
 
 /// Paste a chunk that may contain mixed text and whitespace.
@@ -160,9 +203,15 @@ fn is_xwayland_focused() -> bool {
         }
     };
 
-    let xwayland = json.get("xwayland").and_then(|v| v.as_bool()).unwrap_or(false);
+    let xwayland = json
+        .get("xwayland")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if xwayland {
-        let class = json.get("class").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let class = json
+            .get("class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         info!(class, "focused window is XWayland");
     }
     xwayland

@@ -22,12 +22,11 @@ fn find_keyboards() -> Result<Vec<PathBuf>> {
         if !name.starts_with("event") {
             continue;
         }
-        if let Ok(device) = Device::open(&path) {
-            if device.supported_keys().is_some_and(|keys| keys.contains(Key::KEY_RIGHTALT)) {
+        if let Ok(device) = Device::open(&path)
+            && device.supported_keys().is_some_and(|keys| keys.contains(Key::KEY_RIGHTALT)) {
                 info!(path = %path.display(), name = ?device.name(), "found keyboard");
                 keyboards.push(path);
             }
-        }
     }
     if keyboards.is_empty() {
         anyhow::bail!(

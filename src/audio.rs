@@ -1,14 +1,12 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleRate, StreamConfig};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
-/// Lightweight, Send+Sync handle to the audio buffer.
-/// Can be cloned and sent to other threads for snapshotting.
 #[derive(Clone)]
 pub struct AudioBufferHandle {
     buffer: Arc<Mutex<Vec<f32>>>,
@@ -31,11 +29,25 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-    pub fn new() -> Result<Self> {
+    pub fn new(device_name: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .context("no input device available")?;
+
+        let device = if let Some(name) = device_name {
+            match host
+                .input_devices()?
+                .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+            {
+                Some(d) => Some(d),
+                None => {
+                    warn!(name, "configured input device not found, using default");
+                    host.default_input_device()
+                }
+            }
+        } else {
+            host.default_input_device()
+        };
+
+        let device = device.context("no input device available")?;
 
         info!(device = ?device.name(), "using input device");
 
@@ -55,11 +67,10 @@ impl AudioCapture {
             .build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if rec_clone.load(Ordering::Relaxed) {
-                        if let Ok(mut buf) = buf_clone.lock() {
+                    if rec_clone.load(Ordering::Relaxed)
+                        && let Ok(mut buf) = buf_clone.lock() {
                             buf.extend_from_slice(data);
                         }
-                    }
                 },
                 move |err| {
                     warn!(error = %err, "audio stream error");
@@ -96,7 +107,11 @@ impl AudioCapture {
         self.recording.store(false, Ordering::Relaxed);
         let samples = std::mem::take(&mut *self.buffer.lock().unwrap());
         let duration = samples.len() as f32 / WHISPER_SAMPLE_RATE as f32;
-        info!(samples = samples.len(), duration_secs = duration, "recording stopped");
+        info!(
+            samples = samples.len(),
+            duration_secs = duration,
+            "recording stopped"
+        );
         samples
     }
 

@@ -14,6 +14,7 @@ use input::KeyEvent;
 use overlay::OverlayCommand;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
@@ -47,10 +48,29 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("received SIGINT, shutting down");
+                    std::process::exit(0);
+                }
+                _ = sighup.recv() => {
+                    info!("received SIGHUP, reloading config");
+                    config::Config::request_reload();
+                }
+            }
+        }
+    });
+
     // Preflight checks
     paste::check_wtype()?;
+    let config = config::Config::load();
     let transcriber = Arc::new(transcribe::Transcriber::new(args.server));
-    let audio = audio::AudioCapture::new()?;
+    let audio = audio::AudioCapture::new(config.input_device.as_deref())?;
     let audio_handle = audio.buffer_handle();
 
     info!("justspeak ready - hold Right Alt (AltGr) or MIDI foot pedal to speak");
@@ -63,6 +83,11 @@ async fn main() -> Result<()> {
     let mut state = State::Idle;
 
     while let Some(event) = rx.recv().await {
+        if config::Config::reload_if_requested() {
+            let new_config = config::Config::load();
+            info!(blips_enabled = new_config.blips_enabled, "config reloaded");
+        }
+
         match (state, event) {
             (State::Idle, KeyEvent::AltGrPressed) => {
                 audio.start_recording();
@@ -120,8 +145,7 @@ async fn main() -> Result<()> {
 
                     if duration < 0.3 {
                         warn!(duration, "recording too short, ignoring");
-                        overlay_handle.send(OverlayCommand::Close);
-                        overlay_handle.join();
+                        overlay_handle.close_and_join();
                         state = State::Idle;
                         continue;
                     }
@@ -156,8 +180,7 @@ async fn main() -> Result<()> {
                                     ));
                                     tokio::time::sleep(std::time::Duration::from_secs(2))
                                         .await;
-                                    overlay_handle.send(OverlayCommand::Close);
-                                    overlay_handle.join();
+                                    overlay_handle.close_and_join();
                                     state = State::Idle;
                                     continue;
                                 }
@@ -175,8 +198,7 @@ async fn main() -> Result<()> {
 
                     if final_text.is_empty() {
                         warn!("final transcription returned empty text");
-                        overlay_handle.send(OverlayCommand::Close);
-                        overlay_handle.join();
+                        overlay_handle.close_and_join();
                         state = State::Idle;
                         continue;
                     }
@@ -253,8 +275,40 @@ async fn streaming_transcription(
     ws_url: String,
     overlay_tx: std::sync::mpsc::Sender<OverlayCommand>,
 ) -> Result<String> {
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_DELAY_MS: u64 = 500;
+
+    let mut last_error = None;
+
+    for attempt in 0..MAX_RETRIES {
+        if attempt > 0 {
+            info!(attempt, "retrying WebSocket connection");
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+
+        match streaming_transcription_inner(&stop, &audio_handle, &ws_url, overlay_tx.clone()).await {
+            Ok(text) => return Ok(text),
+            Err(e) => {
+                warn!(attempt, error = %e, "streaming transcription failed");
+                last_error = Some(e);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("max retries exceeded")))
+}
+
+async fn streaming_transcription_inner(
+    stop: &Arc<AtomicBool>,
+    audio_handle: &audio::AudioBufferHandle,
+    ws_url: &str,
+    overlay_tx: std::sync::mpsc::Sender<OverlayCommand>,
+) -> Result<String> {
     let (ws_stream, _) =
-        tokio_tungstenite::connect_async(&ws_url)
+        tokio_tungstenite::connect_async(ws_url)
             .await
             .context("failed to connect to nemospeech WebSocket")?;
 
@@ -364,21 +418,19 @@ fn samples_to_s16le(samples: &[f32]) -> Vec<u8> {
 }
 
 /// Get cursor position from Hyprland via hyprctl.
-/// Falls back to screen center if unavailable.
+/// Falls back to a reasonable position if unavailable.
 fn get_cursor_position() -> (f32, f32) {
     if let Ok(output) = std::process::Command::new("hyprctl")
         .args(["cursorpos", "-j"])
         .output()
-    {
-        if let Ok(text) = String::from_utf8(output.stdout) {
+        && let Ok(text) = String::from_utf8(output.stdout) {
             let x = extract_json_number(&text, "x");
             let y = extract_json_number(&text, "y");
             if let (Some(x), Some(y)) = (x, y) {
                 return (x, y);
             }
         }
-    }
-    (960.0, 800.0)
+    (960.0, 540.0)
 }
 
 fn extract_json_number(json: &str, key: &str) -> Option<f32> {
