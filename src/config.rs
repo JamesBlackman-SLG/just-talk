@@ -73,7 +73,7 @@ impl Config {
         config.server.url
     }
 
-    fn config_path() -> Option<PathBuf> {
+    pub fn config_path() -> Option<PathBuf> {
         std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))

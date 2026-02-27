@@ -14,6 +14,14 @@ pub fn paste_text(text: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Ensure text ends with a space so consecutive transcriptions don't run together
+    let text = if !text.ends_with(|c: char| c.is_whitespace()) {
+        format!("{text} ")
+    } else {
+        text.to_string()
+    };
+    let text = text.as_str();
+
     // Wait for focus to settle after overlay closes
     std::thread::sleep(std::time::Duration::from_millis(150));
 

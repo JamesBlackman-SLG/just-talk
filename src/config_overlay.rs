@@ -32,12 +32,14 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
+use cpal::traits::{DeviceTrait, HostTrait};
+
 use crate::config::{Config, ServerConfig};
 
 // ---- Styling constants ----
 
 const PANEL_WIDTH: f32 = 560.0;
-const PANEL_HEIGHT: f32 = 380.0;
+const PANEL_HEIGHT: f32 = 420.0;
 const PANEL_CORNER_RADIUS: f32 = 16.0;
 const PANEL_PADDING: f32 = 24.0;
 const PANEL_BG_R: u8 = 0x1A;
@@ -47,7 +49,7 @@ const PANEL_BG_ALPHA: u8 = 0xFF;
 const BORDER_R: u8 = 0x58;
 const BORDER_G: u8 = 0x58;
 const BORDER_B: u8 = 0x80;
-const BORDER_ALPHA: u8 = 0xCC;
+const BORDER_ALPHA: u8 = 0xFF;
 const BORDER_WIDTH: f32 = 2.0;
 
 const TITLE_FONT_SIZE: f32 = 32.0;
@@ -60,8 +62,13 @@ const LABEL_WIDTH: f32 = 150.0;
 const FIELD_FONT_SIZE: f32 = 15.0;
 const FIELD_LINE_HEIGHT: f32 = 20.0;
 
-const ROW_HOVER_ALPHA: u8 = 0x30;
-const ROW_FOCUS_ALPHA: u8 = 0x50;
+// Row highlight colors (opaque, slightly lighter than panel bg)
+const ROW_HOVER_R: u8 = 0x24;
+const ROW_HOVER_G: u8 = 0x24;
+const ROW_HOVER_B: u8 = 0x3A;
+const ROW_FOCUS_R: u8 = 0x2E;
+const ROW_FOCUS_G: u8 = 0x2E;
+const ROW_FOCUS_B: u8 = 0x48;
 
 // Toggle badge
 const TOGGLE_WIDTH: u32 = 52;
@@ -90,24 +97,56 @@ const BTN_HOVER_B: u8 = 0x5A;
 const BTN_FONT_SIZE: f32 = 15.0;
 const BTN_LINE_HEIGHT: f32 = 20.0;
 
-const BACKDROP_ALPHA: u8 = 0xFF;
+// Edit config button (smaller, inline with path)
+const EDIT_BTN_WIDTH: u32 = 56;
+const EDIT_BTN_HEIGHT: u32 = 26;
+const CONFIG_PATH_FONT_SIZE: f32 = 12.0;
+const CONFIG_PATH_LINE_HEIGHT: f32 = 16.0;
+
+const BACKDROP_ALPHA: u8 = 0x60;
 
 // ---- Field definitions ----
 
-const FIELD_SERVER_URL: usize = 0;
-const FIELD_BLIP_DEVICE: usize = 1;
-const FIELD_BLIPS_ENABLED: usize = 2;
-const FIELD_MIDI_CC: usize = 3;
-const FIELD_INPUT_DEVICE: usize = 4;
+const FIELD_INPUT_DEVICE: usize = 0;
+const FIELD_SERVER_URL: usize = 1;
+const FIELD_BLIP_DEVICE: usize = 2;
+const FIELD_BLIPS_ENABLED: usize = 3;
+const FIELD_MIDI_CC: usize = 4;
 const FIELD_COUNT: usize = 5;
 
 const FIELD_LABELS: [&str; FIELD_COUNT] = [
+    "Input Device",
     "Server URL",
     "Blip Device",
     "Blips",
     "MIDI CC",
-    "Input Device",
 ];
+
+// ---- Field kind + dropdown ----
+
+#[derive(Clone, Copy, PartialEq)]
+enum FieldKind {
+    Text,
+    Toggle,
+    DevicePicker,
+}
+
+fn field_kind(index: usize) -> FieldKind {
+    match index {
+        FIELD_INPUT_DEVICE | FIELD_BLIP_DEVICE => FieldKind::DevicePicker,
+        FIELD_BLIPS_ENABLED => FieldKind::Toggle,
+        _ => FieldKind::Text,
+    }
+}
+
+struct DropdownState {
+    field_index: usize,
+    items: Vec<String>,
+    highlighted: usize,
+    scroll_offset: usize,
+}
+
+const DROPDOWN_MAX_VISIBLE: usize = 6;
 
 // ---- Public API ----
 
@@ -166,12 +205,21 @@ struct ConfigState {
     midi_cc_str: String,
     input_device: String,
 
+    // Device lists (enumerated once at startup)
+    input_device_list: Vec<String>,
+    output_device_list: Vec<String>,
+
+    // Config file path (resolved once at startup)
+    config_path: String,
+
     // UI state
     focused_field: Option<usize>,
     cursor_pos: usize,
     hover_row: Option<usize>,
     btn_hover: bool,
+    edit_btn_hover: bool,
     cursor_blink_start: Instant,
+    dropdown: Option<DropdownState>,
 }
 
 // ---- Layout helpers ----
@@ -182,6 +230,9 @@ struct PanelLayout {
     title_y: f32,
     sep_y: f32,
     rows_y: f32,
+    config_path_y: f32,
+    edit_btn_x: f32,
+    edit_btn_y: f32,
     btn_x: f32,
     btn_y: f32,
 }
@@ -194,12 +245,18 @@ fn panel_layout(width: u32, height: u32) -> PanelLayout {
     let rows_y = sep_y + 1.0 + SEPARATOR_GAP;
     let btn_x = px + (PANEL_WIDTH - BTN_WIDTH as f32) / 2.0;
     let btn_y = py + PANEL_HEIGHT - PANEL_PADDING - BTN_HEIGHT as f32;
+    let config_path_y = rows_y + FIELD_COUNT as f32 * ROW_HEIGHT + 8.0;
+    let edit_btn_x = px + PANEL_WIDTH - PANEL_PADDING - EDIT_BTN_WIDTH as f32;
+    let edit_btn_y = config_path_y;
     PanelLayout {
         px,
         py,
         title_y,
         sep_y,
         rows_y,
+        config_path_y,
+        edit_btn_x,
+        edit_btn_y,
         btn_x,
         btn_y,
     }
@@ -237,6 +294,24 @@ fn run_config_thread(rx: mpsc::Receiver<ConfigCommand>) -> Result<()> {
     let swash_cache = SwashCache::new();
     let pool = SlotPool::new(256 * 256 * 4, &shm)?;
 
+    // Enumerate audio devices once at startup.
+    // Input devices: cpal names (used by audio.rs to match via cpal).
+    // Output/blip devices: PipeWire sink node names (used via PIPEWIRE_NODE env var).
+    let audio_host = cpal::default_host();
+    let input_device_list: Vec<String> = audio_host
+        .input_devices()
+        .map(|devs| {
+            devs.filter_map(|d| d.name().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let output_device_list: Vec<String> = enumerate_pipewire_sinks();
+    info!(
+        input_count = input_device_list.len(),
+        output_count = output_device_list.len(),
+        "enumerated audio devices"
+    );
+
     let config = Config::load();
 
     let mut state = ConfigState {
@@ -263,11 +338,20 @@ fn run_config_thread(rx: mpsc::Receiver<ConfigCommand>) -> Result<()> {
         midi_cc_str: config.midi_cc.map(|v| v.to_string()).unwrap_or_default(),
         input_device: config.input_device.unwrap_or_default(),
 
+        input_device_list,
+        output_device_list,
+
+        config_path: Config::config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+
         focused_field: None,
         cursor_pos: 0,
         hover_row: None,
         btn_hover: false,
+        edit_btn_hover: false,
         cursor_blink_start: Instant::now(),
+        dropdown: None,
     };
 
     while !state.done {
@@ -310,7 +394,7 @@ impl ConfigState {
     }
 
     fn is_text_field(index: usize) -> bool {
-        index != FIELD_BLIPS_ENABLED
+        field_kind(index) == FieldKind::Text
     }
 
     fn save_config(&self) {
@@ -350,6 +434,62 @@ impl ConfigState {
         }
     }
 
+    fn open_dropdown(&mut self, field_index: usize) {
+        let device_list = match field_index {
+            FIELD_INPUT_DEVICE => &self.input_device_list,
+            FIELD_BLIP_DEVICE => &self.output_device_list,
+            _ => return,
+        };
+        let placeholder = if field_index == FIELD_INPUT_DEVICE {
+            "(default)"
+        } else {
+            "(none)"
+        };
+        let mut items = vec![placeholder.to_string()];
+        items.extend(device_list.iter().cloned());
+
+        let current_value = self.field_value(field_index);
+        let highlighted = if current_value.is_empty() {
+            0
+        } else {
+            items
+                .iter()
+                .position(|s| s == current_value)
+                .unwrap_or(0)
+        };
+        let scroll_offset = highlighted.saturating_sub(DROPDOWN_MAX_VISIBLE / 2);
+
+        self.unfocus();
+        self.dropdown = Some(DropdownState {
+            field_index,
+            items,
+            highlighted,
+            scroll_offset,
+        });
+    }
+
+    fn close_dropdown(&mut self) {
+        self.dropdown = None;
+    }
+
+    fn select_dropdown_item(&mut self) {
+        if let Some(dd) = self.dropdown.take() {
+            let value = &dd.items[dd.highlighted];
+            let is_placeholder = dd.highlighted == 0;
+            let new_val = if is_placeholder {
+                String::new()
+            } else {
+                value.clone()
+            };
+            match dd.field_index {
+                FIELD_INPUT_DEVICE => self.input_device = new_val,
+                FIELD_BLIP_DEVICE => self.blip_device = new_val,
+                _ => {}
+            }
+            self.save_config();
+        }
+    }
+
     fn hit_test_row(&self, x: f64, y: f64) -> Option<usize> {
         let l = panel_layout(self.width, self.height);
         let fy = y as f32;
@@ -376,6 +516,53 @@ impl ConfigState {
             && fy < l.btn_y + BTN_HEIGHT as f32
     }
 
+    fn hit_test_dropdown(&self, x: f64, y: f64) -> Option<usize> {
+        let dd = self.dropdown.as_ref()?;
+        let l = panel_layout(self.width, self.height);
+        let fx = x as f32;
+        let fy = y as f32;
+
+        let anchor_y = l.rows_y + dd.field_index as f32 * ROW_HEIGHT + ROW_HEIGHT;
+        let dd_x = l.px + PANEL_PADDING + LABEL_WIDTH;
+        let dd_w = PANEL_WIDTH - PANEL_PADDING - LABEL_WIDTH - PANEL_PADDING;
+        let visible_count = dd.items.len().min(DROPDOWN_MAX_VISIBLE);
+
+        if fx < dd_x || fx > dd_x + dd_w {
+            return None;
+        }
+        if fy < anchor_y || fy >= anchor_y + visible_count as f32 * ROW_HEIGHT {
+            return None;
+        }
+        let row = ((fy - anchor_y) / ROW_HEIGHT) as usize;
+        Some(dd.scroll_offset + row)
+    }
+
+    fn hit_test_edit_btn(&self, x: f64, y: f64) -> bool {
+        let l = panel_layout(self.width, self.height);
+        let fx = x as f32;
+        let fy = y as f32;
+        fx >= l.edit_btn_x
+            && fx < l.edit_btn_x + EDIT_BTN_WIDTH as f32
+            && fy >= l.edit_btn_y
+            && fy < l.edit_btn_y + EDIT_BTN_HEIGHT as f32
+    }
+
+    fn open_config_in_editor(&self) {
+        if self.config_path.is_empty() {
+            return;
+        }
+        let path = self.config_path.clone();
+        std::thread::spawn(move || {
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| "xdg-open".to_string());
+            info!(editor = %editor, path = %path, "opening config in editor");
+            if let Err(e) = std::process::Command::new(&editor).arg(&path).spawn() {
+                warn!(error = %e, editor = %editor, "failed to open editor");
+            }
+        });
+    }
+
     fn is_over_panel(&self, x: f64, y: f64) -> bool {
         let l = panel_layout(self.width, self.height);
         let fx = x as f32;
@@ -387,6 +574,29 @@ impl ConfigState {
     }
 
     fn handle_click(&mut self, x: f64, y: f64) {
+        // If dropdown is open, check it first
+        if self.dropdown.is_some() {
+            if let Some(item_idx) = self.hit_test_dropdown(x, y) {
+                if let Some(dd) = self.dropdown.as_mut() {
+                    if item_idx < dd.items.len() {
+                        dd.highlighted = item_idx;
+                    }
+                }
+                self.select_dropdown_item();
+                return;
+            }
+            // Click outside dropdown closes it
+            self.close_dropdown();
+            // Fall through to handle the click normally
+        }
+
+        if self.hit_test_edit_btn(x, y) {
+            self.save_config();
+            self.open_config_in_editor();
+            self.done = true;
+            return;
+        }
+
         if self.hit_test_btn(x, y) || !self.is_over_panel(x, y) {
             self.unfocus();
             self.save_config();
@@ -395,13 +605,21 @@ impl ConfigState {
         }
 
         if let Some(row) = self.hit_test_row(x, y) {
-            if row == FIELD_BLIPS_ENABLED {
-                self.unfocus();
-                self.blips_enabled = !self.blips_enabled;
-                self.save_config();
-            } else if self.focused_field != Some(row) {
-                self.unfocus();
-                self.focus_field(row);
+            match field_kind(row) {
+                FieldKind::Toggle => {
+                    self.unfocus();
+                    self.blips_enabled = !self.blips_enabled;
+                    self.save_config();
+                }
+                FieldKind::DevicePicker => {
+                    self.open_dropdown(row);
+                }
+                FieldKind::Text => {
+                    if self.focused_field != Some(row) {
+                        self.unfocus();
+                        self.focus_field(row);
+                    }
+                }
             }
         } else {
             self.unfocus();
@@ -410,6 +628,60 @@ impl ConfigState {
 
     fn handle_key(&mut self, event: &KbKeyEvent) {
         let keysym = event.keysym;
+
+        // Dropdown keyboard handling takes priority
+        if self.dropdown.is_some() {
+            match keysym {
+                Keysym::Escape => {
+                    self.close_dropdown();
+                    return;
+                }
+                Keysym::Return | Keysym::KP_Enter => {
+                    self.select_dropdown_item();
+                    return;
+                }
+                Keysym::Up => {
+                    if let Some(dd) = self.dropdown.as_mut() {
+                        if dd.highlighted > 0 {
+                            dd.highlighted -= 1;
+                            if dd.highlighted < dd.scroll_offset {
+                                dd.scroll_offset = dd.highlighted;
+                            }
+                        }
+                    }
+                    return;
+                }
+                Keysym::Down => {
+                    if let Some(dd) = self.dropdown.as_mut() {
+                        if dd.highlighted + 1 < dd.items.len() {
+                            dd.highlighted += 1;
+                            if dd.highlighted >= dd.scroll_offset + DROPDOWN_MAX_VISIBLE {
+                                dd.scroll_offset = dd.highlighted + 1 - DROPDOWN_MAX_VISIBLE;
+                            }
+                        }
+                    }
+                    return;
+                }
+                Keysym::Home => {
+                    if let Some(dd) = self.dropdown.as_mut() {
+                        dd.highlighted = 0;
+                        dd.scroll_offset = 0;
+                    }
+                    return;
+                }
+                Keysym::End => {
+                    if let Some(dd) = self.dropdown.as_mut() {
+                        dd.highlighted = dd.items.len().saturating_sub(1);
+                        dd.scroll_offset = dd
+                            .items
+                            .len()
+                            .saturating_sub(DROPDOWN_MAX_VISIBLE);
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
 
         if keysym == Keysym::Escape {
             self.unfocus();
@@ -426,9 +698,12 @@ impl ConfigState {
 
         if keysym == Keysym::Tab {
             self.unfocus();
+            // Skip non-text fields (DevicePicker, Toggle)
             let mut next = (field_idx + 1) % FIELD_COUNT;
-            if next == FIELD_BLIPS_ENABLED {
+            let mut attempts = 0;
+            while field_kind(next) != FieldKind::Text && attempts < FIELD_COUNT {
                 next = (next + 1) % FIELD_COUNT;
+                attempts += 1;
             }
             self.focus_field(next);
             return;
@@ -576,20 +851,28 @@ impl ConfigState {
         };
 
         let field_values: Vec<String> = (0..FIELD_COUNT)
-            .map(|i| {
-                if i == FIELD_BLIPS_ENABLED {
-                    String::new()
-                } else {
-                    match i {
-                        FIELD_SERVER_URL => self.server_url.clone(),
-                        FIELD_BLIP_DEVICE => self.blip_device.clone(),
-                        FIELD_MIDI_CC => self.midi_cc_str.clone(),
-                        FIELD_INPUT_DEVICE => self.input_device.clone(),
-                        _ => String::new(),
-                    }
-                }
+            .map(|i| match field_kind(i) {
+                FieldKind::Toggle => String::new(),
+                _ => match i {
+                    FIELD_SERVER_URL => self.server_url.clone(),
+                    FIELD_BLIP_DEVICE => self.blip_device.clone(),
+                    FIELD_MIDI_CC => self.midi_cc_str.clone(),
+                    FIELD_INPUT_DEVICE => self.input_device.clone(),
+                    _ => String::new(),
+                },
             })
             .collect();
+
+        // Snapshot dropdown state for rendering
+        let dd_snapshot: Option<(usize, Vec<String>, usize, usize)> =
+            self.dropdown.as_ref().map(|dd| {
+                (
+                    dd.field_index,
+                    dd.items.clone(),
+                    dd.highlighted,
+                    dd.scroll_offset,
+                )
+            });
 
         // Pre-measure cursor offset for the focused text field
         let cursor_x_offset = if let Some(fi) = focused_field {
@@ -707,17 +990,20 @@ impl ConfigState {
             let row_x = l.px + PANEL_PADDING;
             let value_x = l.px + PANEL_PADDING + LABEL_WIDTH;
 
-            let is_focused = focused_field == Some(i);
+            let is_dropdown_active = dd_snapshot
+                .as_ref()
+                .map(|(fi, _, _, _)| *fi == i)
+                .unwrap_or(false);
+            let is_focused = focused_field == Some(i) || is_dropdown_active;
             let is_hovered = hover_row == Some(i) && !is_focused;
 
-            // Row highlight
+            // Row highlight (opaque)
             if is_focused || is_hovered {
-                let alpha = if is_focused {
-                    ROW_FOCUS_ALPHA
+                let highlight = if is_focused {
+                    premul_argb(ROW_FOCUS_R, ROW_FOCUS_G, ROW_FOCUS_B, 0xFF)
                 } else {
-                    ROW_HOVER_ALPHA
+                    premul_argb(ROW_HOVER_R, ROW_HOVER_G, ROW_HOVER_B, 0xFF)
                 };
-                let highlight = premul_argb(0x40, 0x40, 0x60, alpha);
                 fill_rect(
                     canvas,
                     cw,
@@ -818,7 +1104,84 @@ impl ConfigState {
                     ty,
                     0xFF,
                 );
+            } else if field_kind(i) == FieldKind::DevicePicker {
+                // Device picker: read-only value + dropdown indicator
+                let val = &field_values[i];
+                let placeholder = if i == FIELD_INPUT_DEVICE {
+                    "(default)"
+                } else {
+                    "(none)"
+                };
+                let display_text = if val.is_empty() {
+                    placeholder
+                } else {
+                    val.as_str()
+                };
+                let alpha = if val.is_empty() { 0x66 } else { 0xFF };
+
+                let field_w = PANEL_WIDTH - PANEL_PADDING - LABEL_WIDTH - PANEL_PADDING;
+
+                // Render value text
+                {
+                    let metrics = Metrics::new(FIELD_FONT_SIZE, FIELD_LINE_HEIGHT);
+                    let mut buf = TextBuffer::new(&mut self.font_system, metrics);
+                    buf.set_size(
+                        &mut self.font_system,
+                        Some(field_w - 20.0), // leave room for indicator
+                        Some(FIELD_LINE_HEIGHT + 10.0),
+                    );
+                    buf.set_text(
+                        &mut self.font_system,
+                        display_text,
+                        Attrs::new().family(cosmic_text::Family::SansSerif),
+                        Shaping::Advanced,
+                    );
+                    buf.shape_until_scroll(&mut self.font_system, false);
+
+                    render_text(
+                        &mut self.font_system,
+                        &mut self.swash_cache,
+                        &mut buf,
+                        canvas,
+                        cw,
+                        ch,
+                        value_x as i32,
+                        label_y as i32,
+                        alpha,
+                    );
+                }
+
+                // Dropdown indicator "▾"
+                {
+                    let indicator_x = (value_x + field_w - 18.0) as i32;
+                    let metrics = Metrics::new(FIELD_FONT_SIZE, FIELD_LINE_HEIGHT);
+                    let mut buf = TextBuffer::new(&mut self.font_system, metrics);
+                    buf.set_size(
+                        &mut self.font_system,
+                        Some(20.0),
+                        Some(FIELD_LINE_HEIGHT + 10.0),
+                    );
+                    buf.set_text(
+                        &mut self.font_system,
+                        "\u{25BE}",
+                        Attrs::new().family(cosmic_text::Family::SansSerif),
+                        Shaping::Advanced,
+                    );
+                    buf.shape_until_scroll(&mut self.font_system, false);
+                    render_text(
+                        &mut self.font_system,
+                        &mut self.swash_cache,
+                        &mut buf,
+                        canvas,
+                        cw,
+                        ch,
+                        indicator_x,
+                        label_y as i32,
+                        0x88,
+                    );
+                }
             } else {
+                // Text field with editable cursor
                 let val = &field_values[i];
                 let display_text = if val.is_empty() { "(none)" } else { val.as_str() };
                 let alpha = if val.is_empty() && !is_focused {
@@ -878,6 +1241,176 @@ impl ConfigState {
                         cursor_color,
                     );
                 }
+            }
+        }
+
+        // Dropdown overlay (rendered on top of subsequent rows)
+        if let Some((dd_field, dd_items, dd_highlighted, dd_scroll)) = dd_snapshot {
+            let anchor_y = l.rows_y + dd_field as f32 * ROW_HEIGHT + ROW_HEIGHT;
+            let dd_x = l.px + PANEL_PADDING + LABEL_WIDTH;
+            let dd_w = PANEL_WIDTH - PANEL_PADDING - LABEL_WIDTH - PANEL_PADDING;
+            let visible_count = dd_items.len().min(DROPDOWN_MAX_VISIBLE);
+            let dd_h = visible_count as f32 * ROW_HEIGHT;
+
+            // Background
+            let dd_bg = premul_argb(0x22, 0x22, 0x38, 0xFF);
+            let dd_border = premul_argb(BORDER_R, BORDER_G, BORDER_B, 0xFF);
+            draw_rounded_rect(
+                canvas,
+                cw,
+                ch,
+                dd_x as i32,
+                anchor_y as i32,
+                dd_w as u32,
+                dd_h as u32 + 2, // +2 for border
+                4.0,
+                dd_bg,
+                dd_border,
+                1.0,
+            );
+
+            // Items
+            for vi in 0..visible_count {
+                let item_idx = dd_scroll + vi;
+                if item_idx >= dd_items.len() {
+                    break;
+                }
+                let item_y = anchor_y + vi as f32 * ROW_HEIGHT;
+                let is_highlighted = item_idx == dd_highlighted;
+
+                if is_highlighted {
+                    let hl = premul_argb(0x3A, 0x3A, 0x5A, 0xFF);
+                    fill_rect(
+                        canvas,
+                        cw,
+                        ch,
+                        (dd_x + 1.0) as i32,
+                        item_y as i32,
+                        (dd_w - 2.0) as u32,
+                        ROW_HEIGHT as u32,
+                        hl,
+                    );
+                }
+
+                let item_text = &dd_items[item_idx];
+                let alpha = if item_idx == 0 { 0x88 } else { 0xFF }; // placeholder dimmer
+                let text_y = item_y + (ROW_HEIGHT - FIELD_LINE_HEIGHT) / 2.0;
+                let metrics = Metrics::new(FIELD_FONT_SIZE, FIELD_LINE_HEIGHT);
+                let mut buf = TextBuffer::new(&mut self.font_system, metrics);
+                buf.set_size(
+                    &mut self.font_system,
+                    Some(dd_w - 12.0),
+                    Some(FIELD_LINE_HEIGHT + 10.0),
+                );
+                buf.set_text(
+                    &mut self.font_system,
+                    item_text,
+                    Attrs::new().family(cosmic_text::Family::SansSerif),
+                    Shaping::Advanced,
+                );
+                buf.shape_until_scroll(&mut self.font_system, false);
+                render_text(
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                    &mut buf,
+                    canvas,
+                    cw,
+                    ch,
+                    (dd_x + 6.0) as i32,
+                    text_y as i32,
+                    alpha,
+                );
+            }
+        }
+
+        // Config file path + Edit button
+        if !self.config_path.is_empty() {
+            // Path text (dimmed, small)
+            {
+                let metrics = Metrics::new(CONFIG_PATH_FONT_SIZE, CONFIG_PATH_LINE_HEIGHT);
+                let mut buf = TextBuffer::new(&mut self.font_system, metrics);
+                let max_path_w = PANEL_WIDTH - PANEL_PADDING * 2.0 - EDIT_BTN_WIDTH as f32 - 12.0;
+                buf.set_size(
+                    &mut self.font_system,
+                    Some(max_path_w),
+                    Some(CONFIG_PATH_LINE_HEIGHT + 10.0),
+                );
+                buf.set_text(
+                    &mut self.font_system,
+                    &self.config_path,
+                    Attrs::new().family(cosmic_text::Family::SansSerif),
+                    Shaping::Advanced,
+                );
+                buf.shape_until_scroll(&mut self.font_system, false);
+
+                let text_y =
+                    l.config_path_y + (EDIT_BTN_HEIGHT as f32 - CONFIG_PATH_LINE_HEIGHT) / 2.0;
+                render_text(
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                    &mut buf,
+                    canvas,
+                    cw,
+                    ch,
+                    (l.px + PANEL_PADDING) as i32,
+                    text_y as i32,
+                    0x66,
+                );
+            }
+
+            // Edit button
+            {
+                let edit_fill = if self.edit_btn_hover {
+                    premul_argb(BTN_HOVER_R, BTN_HOVER_G, BTN_HOVER_B, PANEL_BG_ALPHA)
+                } else {
+                    premul_argb(BTN_BG_R, BTN_BG_G, BTN_BG_B, PANEL_BG_ALPHA)
+                };
+                draw_rounded_rect(
+                    canvas,
+                    cw,
+                    ch,
+                    l.edit_btn_x as i32,
+                    l.edit_btn_y as i32,
+                    EDIT_BTN_WIDTH,
+                    EDIT_BTN_HEIGHT,
+                    6.0,
+                    edit_fill,
+                    border,
+                    1.0,
+                );
+
+                let metrics = Metrics::new(CONFIG_PATH_FONT_SIZE, CONFIG_PATH_LINE_HEIGHT);
+                let mut buf = TextBuffer::new(&mut self.font_system, metrics);
+                buf.set_size(
+                    &mut self.font_system,
+                    Some(EDIT_BTN_WIDTH as f32),
+                    Some(EDIT_BTN_HEIGHT as f32),
+                );
+                buf.set_text(
+                    &mut self.font_system,
+                    "Edit",
+                    Attrs::new().family(cosmic_text::Family::SansSerif),
+                    Shaping::Advanced,
+                );
+                buf.shape_until_scroll(&mut self.font_system, false);
+                let mut tw = 0.0_f32;
+                for run in buf.layout_runs() {
+                    tw = tw.max(run.line_w);
+                }
+                let tx = l.edit_btn_x as i32 + ((EDIT_BTN_WIDTH as f32 - tw) / 2.0) as i32;
+                let ty = l.edit_btn_y as i32
+                    + ((EDIT_BTN_HEIGHT as f32 - CONFIG_PATH_FONT_SIZE) / 2.0) as i32;
+                render_text(
+                    &mut self.font_system,
+                    &mut self.swash_cache,
+                    &mut buf,
+                    canvas,
+                    cw,
+                    ch,
+                    tx,
+                    ty,
+                    0xCC,
+                );
             }
         }
 
@@ -957,6 +1490,33 @@ impl ConfigState {
             .expect("buffer attach");
         self.layer.commit();
     }
+}
+
+// ---- Device enumeration ----
+
+/// Enumerate PipeWire audio sinks by node name.
+/// Blip device config uses PipeWire node names (routed via PIPEWIRE_NODE env var),
+/// so we query `pactl list sinks short` which returns PipeWire/PulseAudio sink names.
+fn enumerate_pipewire_sinks() -> Vec<String> {
+    let output = match std::process::Command::new("pactl")
+        .args(["list", "sinks", "short"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, "failed to run pactl for sink enumeration");
+            return Vec::new();
+        }
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .filter_map(|line| {
+            // Format: ID\tNAME\tDRIVER\tFORMAT\tSTATE
+            let mut cols = line.split('\t');
+            cols.next(); // skip ID
+            cols.next().map(|name| name.to_string())
+        })
+        .collect()
 }
 
 // ---- Helper functions ----
@@ -1269,12 +1829,25 @@ impl PointerHandler for ConfigState {
         for event in events {
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    // Update dropdown highlight on hover
+                    if let Some(item_idx) =
+                        self.hit_test_dropdown(event.position.0, event.position.1)
+                    {
+                        if let Some(dd) = self.dropdown.as_mut() {
+                            if item_idx < dd.items.len() {
+                                dd.highlighted = item_idx;
+                            }
+                        }
+                    }
                     self.hover_row = self.hit_test_row(event.position.0, event.position.1);
                     self.btn_hover = self.hit_test_btn(event.position.0, event.position.1);
+                    self.edit_btn_hover =
+                        self.hit_test_edit_btn(event.position.0, event.position.1);
                 }
                 PointerEventKind::Leave { .. } => {
                     self.hover_row = None;
                     self.btn_hover = false;
+                    self.edit_btn_hover = false;
                 }
                 PointerEventKind::Press { button, .. } => {
                     if button == BTN_LEFT {
