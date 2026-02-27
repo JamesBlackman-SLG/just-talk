@@ -139,6 +139,25 @@ impl Config {
         new_value
     }
 
+    pub fn save(&self) {
+        let Some(path) = Self::config_path() else {
+            warn!("cannot determine config path, save failed");
+            return;
+        };
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match toml::to_string_pretty(self) {
+            Ok(s) => match std::fs::write(&path, &s) {
+                Ok(()) => info!(path = %path.display(), "config saved"),
+                Err(e) => warn!(error = %e, "failed to write config"),
+            },
+            Err(e) => warn!(error = %e, "failed to serialize config"),
+        }
+    }
+
     pub fn request_reload() {
         CONFIG_RELOAD_REQUESTED.store(true, Ordering::Relaxed);
     }

@@ -1,6 +1,7 @@
 mod audio;
 mod blip;
 mod config;
+mod config_overlay;
 mod input;
 mod midi;
 mod overlay;
@@ -124,7 +125,7 @@ async fn main() -> Result<()> {
                     loop {
                         match rx.recv().await {
                             Some(KeyEvent::AltGrReleased) => break,
-                            Some(KeyEvent::AltGrPressed) | Some(KeyEvent::DoubleTap) => continue,
+                            Some(KeyEvent::AltGrPressed) | Some(KeyEvent::DoubleTap) | Some(KeyEvent::ConfigOpen) => continue,
                             None => return Ok(()),
                         }
                     }
@@ -256,11 +257,20 @@ async fn main() -> Result<()> {
                 blip::play_toggle_sound(enabled);
             }
 
+            (State::Idle, KeyEvent::ConfigOpen) => {
+                info!("opening config overlay");
+                match config_overlay::spawn_config_overlay() {
+                    Ok(handle) => handle.wait(),
+                    Err(e) => warn!(error = %e, "failed to open config overlay"),
+                }
+            }
+
             // Ignore spurious events
             (State::Idle, KeyEvent::AltGrReleased) => {}
             (State::Recording, KeyEvent::AltGrPressed) => {} // repeat
             (State::Recording, KeyEvent::AltGrReleased) => {} // handled in overlay branch above
             (State::Recording, KeyEvent::DoubleTap) => {}    // ignore during recording
+            (State::Recording, KeyEvent::ConfigOpen) => {}   // ignore during recording
         }
     }
 

@@ -10,6 +10,7 @@ pub enum KeyEvent {
     AltGrPressed,
     AltGrReleased,
     DoubleTap,
+    ConfigOpen,
 }
 
 /// Find all keyboard devices in /dev/input/
@@ -57,12 +58,33 @@ pub fn spawn_listener(tx: mpsc::UnboundedSender<KeyEvent>) -> Result<()> {
             let mut last_press_time: Option<Instant> = None;
             let mut last_release_time: Option<Instant> = None;
             let mut suppress_release = false;
+            let mut ctrl_held = false;
 
             loop {
                 match device.fetch_events() {
                     Ok(events) => {
                         for ev in events {
+                            // Track Ctrl key state (both left and right)
+                            if let InputEventKind::Key(Key::KEY_LEFTCTRL | Key::KEY_RIGHTCTRL) =
+                                ev.kind()
+                            {
+                                match ev.value() {
+                                    1 => ctrl_held = true,
+                                    0 => ctrl_held = false,
+                                    _ => {} // repeat
+                                }
+                                continue;
+                            }
+
                             if let InputEventKind::Key(Key::KEY_RIGHTALT) = ev.kind() {
+                                // Ctrl+AltGr → config screen
+                                if ctrl_held && ev.value() == 1 {
+                                    debug!(?ev, "Ctrl+AltGr detected, opening config");
+                                    suppress_release = true;
+                                    let _ = tx.send(KeyEvent::ConfigOpen);
+                                    continue;
+                                }
+
                                 let event = match ev.value() {
                                     1 => {
                                         // Press: check for double-tap
