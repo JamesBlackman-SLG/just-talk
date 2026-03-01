@@ -11,7 +11,7 @@ mod transcribe;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use single_instance::SingleInstance;
+mod single_instance;
 use input::KeyEvent;
 use overlay::OverlayCommand;
 use std::sync::Arc;
@@ -41,9 +41,9 @@ enum State {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Ensure single instance
-    let instance = SingleInstance::new("just-talk").expect("Failed to create single instance lock");
-    if !instance.is_single() {
+    // Ensure single instance (socket uses CLOEXEC so child processes don't inherit the lock)
+    let _instance_lock = single_instance::acquire("just-talk");
+    if _instance_lock.is_none() {
         eprintln!("Error: just-talk is already running");
         std::process::exit(1);
     }
