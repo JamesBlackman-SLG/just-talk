@@ -22,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 # Wayland overlay
+single-instance = "0.3"
 smithay-client-toolkit = { version = "0.19", features = ["calloop"] }
 wayland-client = "0.31"
 tiny-skia = "0.11"

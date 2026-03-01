@@ -11,6 +11,7 @@ mod transcribe;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use single_instance::SingleInstance;
 use input::KeyEvent;
 use overlay::OverlayCommand;
 use std::sync::Arc;
@@ -40,6 +41,13 @@ enum State {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Ensure single instance
+    let instance = SingleInstance::new("just-talk").expect("Failed to create single instance lock");
+    if !instance.is_single() {
+        eprintln!("Error: just-talk is already running");
+        std::process::exit(1);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
