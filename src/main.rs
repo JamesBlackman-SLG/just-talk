@@ -1,7 +1,7 @@
 mod audio;
 mod blip;
 mod config;
-mod config_overlay;
+mod config_tui;
 mod input;
 mod midi;
 mod overlay;
@@ -31,6 +31,10 @@ struct Args {
     /// Disable the fly-in overlay animation
     #[arg(long)]
     no_overlay: bool,
+
+    /// Open the config TUI and exit
+    #[arg(long)]
+    config: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +45,12 @@ enum State {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if args.config {
+        return config_tui::run_config_tui();
+    }
+
     // Ensure single instance (socket uses CLOEXEC so child processes don't inherit the lock)
     let _instance_lock = single_instance::acquire("just-talk");
     if _instance_lock.is_none() {
@@ -54,8 +64,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-
-    let args = Args::parse();
 
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sighup = signal(SignalKind::hangup())?;
@@ -266,10 +274,17 @@ async fn main() -> Result<()> {
             }
 
             (State::Idle, KeyEvent::ConfigOpen) => {
-                info!("opening config overlay");
-                match config_overlay::spawn_config_overlay() {
-                    Ok(handle) => handle.wait(),
-                    Err(e) => warn!(error = %e, "failed to open config overlay"),
+                info!("opening config TUI in floating terminal");
+                if let Err(e) = std::process::Command::new("setsid")
+                    .args([
+                        "uwsm-app", "--",
+                        "xdg-terminal-exec",
+                        "--app-id=org.omarchy.just-talk",
+                        "-e", "just-talk", "--config",
+                    ])
+                    .spawn()
+                {
+                    warn!(error = %e, "failed to launch config terminal");
                 }
             }
 
