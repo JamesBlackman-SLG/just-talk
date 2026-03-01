@@ -1,0 +1,37 @@
+# Maintainer: James Blackman <jamie.blackman@gmail.com>
+pkgname=just-talk
+install=just-talk.install
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Voice dictation app for Wayland - hold Right Alt to dictate"
+arch=('x86_64')
+url="https://github.com/JamesBlackman-SLG/just-talk"
+license=('MIT')
+depends=('libxkbcommon' 'alsa-lib')
+makedepends=('rust' 'cargo')
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/JamesBlackman-SLG/just-talk/archive/v${pkgver}.tar.gz"
+        "just-talk.desktop"
+        "just-talk.install")
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    cargo build --release
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    
+    # Install binary
+    install -Dm755 target/release/just-talk "$pkgdir/usr/bin/just-talk"
+    
+    # Install desktop file
+    install -Dm644 "$srcdir/just-talk.desktop" "$pkgdir/usr/share/applications/just-talk.desktop"
+    
+    # Update desktop database
+    if command -v update-desktop-database &> /dev/null; then
+        update-desktop-database "$pkgdir/usr/share/applications"
+    fi
+}

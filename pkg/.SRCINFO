@@ -1,0 +1,19 @@
+pkgbase = just-talk
+	pkgdesc = Voice dictation app for Wayland - hold Right Alt to dictate
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/JamesBlackman-SLG/just-talk
+	arch = x86_64
+	license = MIT
+	makedepends = rust
+	makedepends = cargo
+	depends = libxkbcommon
+	depends = alsa-lib
+	source = just-talk-0.1.0.tar.gz::https://github.com/JamesBlackman-SLG/just-talk/archive/v0.1.0.tar.gz
+	source = just-talk.desktop
+	sha256sums = SKIP
+	sha256sums = SKIP
+
+	pkgname = just-talk
+	install = just-talk.install
+	arch = x86_64

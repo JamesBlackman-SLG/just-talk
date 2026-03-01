@@ -1,0 +1,13 @@
+post_install() {
+    update-desktop-database -q usr/share/applications
+    echo "Just Talk has been installed!"
+    echo "Hold Right Alt to dictate text."
+}
+
+post_upgrade() {
+    update-desktop-database -q usr/share/applications
+}
+
+post_remove() {
+    update-desktop-database -q usr/share/applications
+}
