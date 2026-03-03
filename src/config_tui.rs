@@ -15,19 +15,17 @@ use ratatui::{
 };
 use std::fs::File;
 
-const FIELD_COUNT: usize = 5;
+const FIELD_COUNT: usize = 4;
 const FIELD_INPUT_DEVICE: usize = 0;
 const FIELD_SERVER_URL: usize = 1;
 const FIELD_BLIP_DEVICE: usize = 2;
 const FIELD_BLIPS_ENABLED: usize = 3;
-const FIELD_MIDI_CC: usize = 4;
 
 const FIELD_LABELS: [&str; FIELD_COUNT] = [
     "Input Device",
     "Server URL",
     "Blip Device",
     "Blips Enabled",
-    "MIDI CC",
 ];
 
 struct App {
@@ -37,7 +35,6 @@ struct App {
     server_url: String,
     blip_device: String,
     blips_enabled: bool,
-    midi_cc_str: String,
     input_device_list: Vec<String>,
     output_device_list: Vec<String>,
     dropdown_open: bool,
@@ -58,7 +55,6 @@ impl App {
             server_url: config.server.url.clone(),
             blip_device: config.blip_device.clone().unwrap_or_default(),
             blips_enabled: config.blips_enabled,
-            midi_cc_str: config.midi_cc.map(|v| v.to_string()).unwrap_or_default(),
             input_device_list,
             output_device_list,
             dropdown_open: false,
@@ -77,7 +73,7 @@ impl App {
     }
 
     fn is_text_field(&self) -> bool {
-        self.selected == FIELD_SERVER_URL || self.selected == FIELD_MIDI_CC
+        self.selected == FIELD_SERVER_URL
     }
 
     fn field_value_mut(&mut self) -> &mut String {
@@ -85,7 +81,6 @@ impl App {
             FIELD_INPUT_DEVICE => &mut self.input_device,
             FIELD_SERVER_URL => &mut self.server_url,
             FIELD_BLIP_DEVICE => &mut self.blip_device,
-            FIELD_MIDI_CC => &mut self.midi_cc_str,
             _ => unreachable!(),
         }
     }
@@ -128,18 +123,6 @@ impl App {
     }
 
     fn save(&mut self) {
-        let midi_cc = if self.midi_cc_str.is_empty() {
-            None
-        } else {
-            match self.midi_cc_str.parse::<u8>() {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    self.status = Some("Invalid MIDI CC (must be 0-127)".into());
-                    return;
-                }
-            }
-        };
-
         let config = Config {
             server: crate::config::ServerConfig {
                 url: self.server_url.clone(),
@@ -150,7 +133,6 @@ impl App {
                 Some(self.blip_device.clone())
             },
             blips_enabled: self.blips_enabled,
-            midi_cc,
             input_device: if self.input_device.is_empty() {
                 None
             } else {
@@ -416,7 +398,6 @@ impl App {
             FIELD_BLIPS_ENABLED => {
                 if self.blips_enabled { "ON".into() } else { "OFF".into() }
             }
-            FIELD_MIDI_CC => self.midi_cc_str.clone(),
             _ => String::new(),
         }
     }

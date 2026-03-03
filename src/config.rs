@@ -18,8 +18,6 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub blips_enabled: bool,
 
-    #[serde(default)]
-    pub midi_cc: Option<u8>,
 
     #[serde(default)]
     pub input_device: Option<String>,
@@ -31,7 +29,6 @@ impl Default for Config {
             server: ServerConfig::default(),
             blip_device: None,
             blips_enabled: true,
-            midi_cc: None,
             input_device: None,
         }
     }
@@ -182,14 +179,12 @@ mod tests {
         assert_eq!(config.server.url, "http://localhost:5051");
         assert!(config.blips_enabled);
         assert!(config.blip_device.is_none());
-        assert!(config.midi_cc.is_none());
     }
 
     #[test]
     fn test_config_deserialization() {
         let toml = r#"blip_device = "my-sink"
 blips_enabled = false
-midi_cc = 65
 input_device = "my-mic"
 
 [server]
@@ -200,7 +195,6 @@ url = "http://localhost:9090"
         assert_eq!(config.server.url, "http://localhost:9090");
         assert_eq!(config.blip_device, Some("my-sink".to_string()));
         assert!(!config.blips_enabled);
-        assert_eq!(config.midi_cc, Some(65));
         assert_eq!(config.input_device, Some("my-mic".to_string()));
     }
 

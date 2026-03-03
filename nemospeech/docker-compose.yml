@@ -1,6 +1,7 @@
 services:
   nemospeech:
     build: .
+    restart: unless-stopped
     ports:
       - "5051:5051"
     deploy:
