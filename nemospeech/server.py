@@ -2,9 +2,13 @@
 """HTTP + WebSocket server for Nemotron ASR transcription."""
 import asyncio
 import json
+import logging
 import os
 import tempfile
 import threading
+
+# Suppress noisy NeMo dataloader warnings that fire on every transcription
+logging.getLogger("nemo.collections.common.data.lhotse.dataloader").setLevel(logging.ERROR)
 
 import numpy as np
 import soundfile as sf
