@@ -2,8 +2,13 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::warn;
+
+/// Serialize access to PIPEWIRE_NODE env var — prevents races between
+/// BlipPlayer::new() and play_toggle_sound() running on different threads.
+static PIPEWIRE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 const SAMPLE_RATE: u32 = 44_100;
 
@@ -38,12 +43,12 @@ impl BlipPlayer {
     pub fn new() -> Result<Self> {
         let app_config = crate::config::Config::load();
 
-        // If a blip_device is configured, set PIPEWIRE_NODE so PipeWire routes
-        // this stream to the desired sink. This works because cpal opens the
-        // default device through PipeWire, and PipeWire checks this env var
-        // when a new stream connects.
+        // Hold lock around env var set → device open → env var clear
+        // to prevent races with play_toggle_sound on another thread
+        let _env_guard = PIPEWIRE_ENV_LOCK.lock().unwrap();
+
         if let Some(ref node) = app_config.blip_device {
-            // SAFETY: called before any other threads use this env var
+            // SAFETY: serialized by PIPEWIRE_ENV_LOCK
             unsafe { std::env::set_var("PIPEWIRE_NODE", node) };
             tracing::info!(node, "routing blip audio via PIPEWIRE_NODE");
         }
@@ -106,11 +111,12 @@ impl BlipPlayer {
 
         stream.play().context("failed to start blip playback")?;
 
-        // Clear so it doesn't affect other audio in this process
         if app_config.blip_device.is_some() {
-            // SAFETY: stream is created, env var no longer needed
+            // SAFETY: serialized by PIPEWIRE_ENV_LOCK
             unsafe { std::env::remove_var("PIPEWIRE_NODE") };
         }
+
+        drop(_env_guard);
 
         Ok(Self {
             _stream: stream,
@@ -150,7 +156,11 @@ pub fn play_toggle_sound(enabled: bool) {
 fn play_toggle_sound_inner(enabled: bool) -> Result<()> {
     let app_config = crate::config::Config::load();
 
+    // Hold lock around env var set → device open → env var clear
+    let _env_guard = PIPEWIRE_ENV_LOCK.lock().unwrap();
+
     if let Some(ref node) = app_config.blip_device {
+        // SAFETY: serialized by PIPEWIRE_ENV_LOCK
         unsafe { std::env::set_var("PIPEWIRE_NODE", node) };
     }
 
@@ -214,8 +224,11 @@ fn play_toggle_sound_inner(enabled: bool) -> Result<()> {
     stream.play().context("failed to play toggle sound")?;
 
     if app_config.blip_device.is_some() {
+        // SAFETY: serialized by PIPEWIRE_ENV_LOCK
         unsafe { std::env::remove_var("PIPEWIRE_NODE") };
     }
+
+    drop(_env_guard);
 
     // Wait for playback to finish
     while played.load(Ordering::Acquire) < total_samples {

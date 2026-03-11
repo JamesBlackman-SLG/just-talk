@@ -68,7 +68,7 @@ impl AudioCapture {
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     if rec_clone.load(Ordering::Relaxed)
-                        && let Ok(mut buf) = buf_clone.lock() {
+                        && let Ok(mut buf) = buf_clone.try_lock() {
                             buf.extend_from_slice(data);
                         }
                 },

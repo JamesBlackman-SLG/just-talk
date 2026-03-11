@@ -51,11 +51,13 @@ async fn main() -> Result<()> {
     }
 
     // Ensure single instance (socket uses CLOEXEC so child processes don't inherit the lock)
-    let _instance_lock = single_instance::acquire("just-talk");
-    if _instance_lock.is_none() {
-        eprintln!("Error: just-talk is already running");
-        std::process::exit(1);
-    }
+    let _instance_lock = match single_instance::acquire("just-talk")? {
+        Some(lock) => lock,
+        None => {
+            eprintln!("Error: just-talk is already running");
+            std::process::exit(1);
+        }
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -361,7 +363,10 @@ async fn streaming_transcription_inner(
             if let Message::Text(text) = msg {
                 let data: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(e) => {
+                        warn!(error = %e, text = %text, "malformed JSON from server");
+                        continue;
+                    }
                 };
                 match data["type"].as_str() {
                     Some("partial") => {
@@ -425,12 +430,10 @@ async fn streaming_transcription_inner(
     {
         Ok(Ok(text)) => text,
         Ok(Err(e)) => {
-            warn!(error = %e, "recv task failed");
-            String::new()
+            anyhow::bail!("recv task failed: {e}");
         }
         Err(_) => {
-            warn!("timed out waiting for final transcription");
-            String::new()
+            anyhow::bail!("timed out waiting for final transcription");
         }
     };
 
@@ -448,7 +451,7 @@ fn samples_to_s16le(samples: &[f32]) -> Vec<u8> {
 }
 
 /// Get cursor position from Hyprland via hyprctl.
-/// Falls back to a reasonable position if unavailable.
+/// Falls back to the center of the focused monitor if cursor position unavailable.
 fn get_cursor_position() -> (f32, f32) {
     if let Ok(output) = std::process::Command::new("hyprctl")
         .args(["cursorpos", "-j"])
@@ -460,6 +463,40 @@ fn get_cursor_position() -> (f32, f32) {
                 return (x, y);
             }
         }
+    warn!("cursor position unavailable, using monitor center");
+    get_active_monitor_center()
+}
+
+/// Query the focused monitor's center as fallback cursor position.
+fn get_active_monitor_center() -> (f32, f32) {
+    if let Ok(output) = std::process::Command::new("hyprctl")
+        .args(["activeworkspace", "-j"])
+        .output()
+        && let Ok(text) = String::from_utf8(output.stdout)
+    {
+        // Get monitor name from active workspace
+        if let Some(monitor) = text.split("\"monitor\"").nth(1)
+            .and_then(|s| s.split('"').nth(1))
+        {
+            // Query that monitor's dimensions
+            if let Ok(mon_output) = std::process::Command::new("hyprctl")
+                .args(["monitors", "-j"])
+                .output()
+                && let Ok(mon_text) = String::from_utf8(mon_output.stdout)
+                && let Ok(monitors) = serde_json::from_str::<Vec<serde_json::Value>>(&mon_text)
+            {
+                for m in &monitors {
+                    if m.get("name").and_then(|v| v.as_str()) == Some(monitor) {
+                        let w = m.get("width").and_then(|v| v.as_f64()).unwrap_or(1920.0);
+                        let h = m.get("height").and_then(|v| v.as_f64()).unwrap_or(1080.0);
+                        let x = m.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y = m.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        return ((x + w / 2.0) as f32, (y + h / 2.0) as f32);
+                    }
+                }
+            }
+        }
+    }
     (960.0, 540.0)
 }
 

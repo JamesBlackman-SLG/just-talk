@@ -14,12 +14,17 @@ pub fn paste_text(text: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Sanitize: replace newlines with spaces — ASR models sometimes produce them,
+    // and wtype/xdotool would press Return, which sends messages in chat apps
+    let text = text.replace('\n', " ").replace('\r', " ");
+
+    // Collapse multiple spaces that may result from newline replacement
+    let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
     // Ensure text ends with a space so consecutive transcriptions don't run together
-    let text = if !text.ends_with(|c: char| c.is_whitespace()) {
-        format!("{text} ")
-    } else {
-        text.to_string()
-    };
+    if !text.ends_with(' ') {
+        text.push(' ');
+    }
     let text = text.as_str();
 
     // Wait for focus to settle after overlay closes
@@ -119,8 +124,8 @@ mod tests {
     #[test]
     fn test_word_chunks_with_punctuation() {
         assert_eq!(
-            word_chunks("Hello, world!\nHow are you?"),
-            vec!["Hello, ", "world!\n", "How ", "are ", "you?"]
+            word_chunks("Hello, world! How are you?"),
+            vec!["Hello, ", "world! ", "How ", "are ", "you?"]
         );
     }
 
@@ -145,28 +150,16 @@ mod tests {
     }
 }
 
-/// Paste a chunk that may contain mixed text and whitespace.
+/// Paste a chunk of text (newlines already sanitized out).
 fn paste_chunk(chunk: &str, xwayland: bool) -> Result<()> {
-    // Split on newlines — wtype needs -k Return for those
-    let parts: Vec<&str> = chunk.split('\n').collect();
-    for (i, part) in parts.iter().enumerate() {
-        if !part.is_empty() {
-            if xwayland {
-                run("xdotool", &["type", "--clearmodifiers", "--", part])?;
-            } else {
-                run("wtype", &["--", part])?;
-            }
-        }
-        // Type newline between parts (not after the last one)
-        if i < parts.len() - 1 {
-            if xwayland {
-                run("xdotool", &["key", "Return"])?;
-            } else {
-                run("wtype", &["-k", "Return"])?;
-            }
-        }
+    if chunk.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    if xwayland {
+        run("xdotool", &["type", "--clearmodifiers", "--", chunk])
+    } else {
+        run("wtype", &["--", chunk])
+    }
 }
 
 /// Run a command, check exit status.

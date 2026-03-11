@@ -11,8 +11,9 @@ impl Drop for Lock {
 
 /// Try to acquire a single-instance lock via an abstract Unix socket.
 /// Returns `Some(Lock)` if we are the only instance, `None` if another is running.
+/// Returns `Err` if the socket couldn't be created (permissions, resource limits, etc.).
 /// The socket is created with SOCK_CLOEXEC so child processes never inherit it.
-pub fn acquire(name: &str) -> Option<Lock> {
+pub fn acquire(name: &str) -> anyhow::Result<Option<Lock>> {
     unsafe {
         let sock = libc::socket(
             libc::AF_UNIX,
@@ -20,7 +21,7 @@ pub fn acquire(name: &str) -> Option<Lock> {
             0,
         );
         if sock < 0 {
-            panic!("Failed to create single-instance socket: {}", std::io::Error::last_os_error());
+            anyhow::bail!("failed to create single-instance socket: {}", std::io::Error::last_os_error());
         }
 
         // Abstract socket: sun_path starts with \0 followed by the name
@@ -43,14 +44,14 @@ pub fn acquire(name: &str) -> Option<Lock> {
         );
 
         if ret == 0 {
-            Some(Lock(sock))
+            Ok(Some(Lock(sock)))
         } else {
             let err = *libc::__errno_location();
             libc::close(sock);
             if err == libc::EADDRINUSE {
-                None
+                Ok(None)
             } else {
-                panic!("Failed to bind single-instance socket: {}", std::io::Error::from_raw_os_error(err));
+                anyhow::bail!("failed to bind single-instance socket: {}", std::io::Error::from_raw_os_error(err));
             }
         }
     }
