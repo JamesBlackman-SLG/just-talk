@@ -4,10 +4,16 @@ use tracing::{info, warn};
 
 use crate::blip;
 
-/// Paste text word-by-word with blip sounds — like Mother from Alien.
+/// Paste text using clipboard (wl-copy + paste keystroke).
 ///
-/// Each word is pasted instantly, then blips play for the word's character count.
-/// The blips serve as the natural pacer between words.
+/// Virtual keyboard character simulation (wtype/xdotool type) creates and destroys
+/// a keyboard device per invocation, causing race conditions — dropped characters,
+/// missing spaces, reordered text. Clipboard paste is atomic and reliable.
+///
+/// Detects terminal vs GUI apps to use the correct paste shortcut:
+/// - Terminals: Ctrl+Shift+V
+/// - GUI apps: Ctrl+V
+/// - XWayland: xdotool equivalents
 pub fn paste_text(text: &str) -> Result<()> {
     if text.is_empty() {
         warn!("empty text, nothing to paste");
@@ -30,39 +36,54 @@ pub fn paste_text(text: &str) -> Result<()> {
     // Wait for focus to settle after overlay closes
     std::thread::sleep(std::time::Duration::from_millis(150));
 
+    // Save current clipboard so we can restore it after pasting
+    let saved_clipboard = Command::new("wl-paste")
+        .arg("--no-newline")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| o.stdout);
+
     // Copy to PRIMARY selection (middle-click paste) as backup
-    // This keeps the CLIPBOARD selection (Ctrl+C/Ctrl+V) untouched
     let _ = Command::new("wl-copy")
         .arg("--primary")
         .arg("--")
         .arg(text)
         .status();
 
-    let xwayland = is_xwayland_focused();
+    let window = get_focused_window();
     info!(
         len = text.len(),
-        xwayland, "pasting word-by-word with blips"
+        xwayland = window.xwayland,
+        terminal = window.terminal,
+        class = %window.class,
+        "pasting via clipboard"
     );
 
     // Blips are opt-in: only play when blip_device is configured and blips are enabled
     let config = crate::config::Config::load();
     if config.blip_device.is_none() || !config.blips_enabled {
-        return bulk_paste(text, xwayland);
+        let result = clipboard_paste(text, &window);
+        restore_clipboard(saved_clipboard);
+        return result;
     }
     let player = match blip::BlipPlayer::new() {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "blip audio unavailable, pasting instantly");
-            return bulk_paste(text, xwayland);
+            let result = clipboard_paste(text, &window);
+            restore_clipboard(saved_clipboard);
+            return result;
         }
     };
 
     // Split into words, keeping trailing whitespace attached to each word
     for chunk in word_chunks(text) {
-        // Paste the whole chunk at once
-        if let Err(e) = paste_chunk(chunk, xwayland) {
-            warn!(error = %e, "paste failed, falling back to bulk");
-            return bulk_paste(text, xwayland);
+        if let Err(e) = clipboard_paste(chunk, &window) {
+            warn!(error = %e, "clipboard paste failed, falling back to bulk");
+            let result = clipboard_paste(text, &window);
+            restore_clipboard(saved_clipboard);
+            return result;
         }
 
         // Play blips for this chunk's length, then wait — blips ARE the delay
@@ -70,6 +91,7 @@ pub fn paste_text(text: &str) -> Result<()> {
         player.wait_for_drain();
     }
 
+    restore_clipboard(saved_clipboard);
     info!("paste complete");
     Ok(())
 }
@@ -150,15 +172,61 @@ mod tests {
     }
 }
 
-/// Paste a chunk of text (newlines already sanitized out).
-fn paste_chunk(chunk: &str, xwayland: bool) -> Result<()> {
-    if chunk.is_empty() {
+struct FocusedWindow {
+    xwayland: bool,
+    terminal: bool,
+    class: String,
+}
+
+/// Copy text to clipboard and simulate the paste keystroke.
+/// Terminals use Ctrl+Shift+V, GUI apps use Ctrl+V.
+fn clipboard_paste(text: &str, window: &FocusedWindow) -> Result<()> {
+    if text.is_empty() {
         return Ok(());
     }
-    if xwayland {
-        run("xdotool", &["type", "--clearmodifiers", "--", chunk])
+
+    // Copy to clipboard
+    let status = Command::new("wl-copy")
+        .arg("--")
+        .arg(text)
+        .status()
+        .context("wl-copy failed")?;
+    if !status.success() {
+        anyhow::bail!("wl-copy exited with status: {status}");
+    }
+
+    // Let the clipboard propagate through the compositor
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    if window.xwayland {
+        if window.terminal {
+            run("xdotool", &["key", "--clearmodifiers", "ctrl+shift+v"])
+        } else {
+            run("xdotool", &["key", "--clearmodifiers", "ctrl+v"])
+        }
+    } else if window.terminal {
+        // Terminals: Ctrl+Shift+V
+        run("wtype", &["-M", "ctrl", "-M", "shift", "-k", "v"])
     } else {
-        run("wtype", &["--", chunk])
+        // GUI apps: Ctrl+V
+        run("wtype", &["-M", "ctrl", "-k", "v"])
+    }
+}
+
+/// Restore the user's clipboard after pasting.
+fn restore_clipboard(saved: Option<Vec<u8>>) {
+    if let Some(data) = saved {
+        let _ = Command::new("wl-copy")
+            .arg("--")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(ref mut stdin) = child.stdin {
+                    let _ = stdin.write_all(&data);
+                }
+                child.wait()
+            });
     }
 }
 
@@ -174,48 +242,43 @@ fn run(cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Bulk-paste fallback (no blips, no delay).
-fn bulk_paste(text: &str, xwayland: bool) -> Result<()> {
-    if xwayland {
-        run("xdotool", &["type", "--clearmodifiers", "--", text])
-    } else {
-        run("wtype", &["--", text])
-    }
-}
-
-/// Check if the currently focused window is an XWayland client.
-fn is_xwayland_focused() -> bool {
+/// Query Hyprland for the focused window's properties.
+/// Returns xwayland status, whether it's a terminal, and the window class.
+fn get_focused_window() -> FocusedWindow {
     let output = match Command::new("hyprctl")
         .args(["activewindow", "-j"])
         .output()
     {
         Ok(o) => o,
         Err(e) => {
-            warn!(error = %e, "failed to run hyprctl, assuming native Wayland");
-            return false;
+            warn!(error = %e, "failed to run hyprctl, assuming native Wayland GUI");
+            return FocusedWindow { xwayland: false, terminal: false, class: "unknown".into() };
         }
     };
 
     let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
         Ok(v) => v,
         Err(e) => {
-            warn!(error = %e, "failed to parse hyprctl output, assuming native Wayland");
-            return false;
+            warn!(error = %e, "failed to parse hyprctl output, assuming native Wayland GUI");
+            return FocusedWindow { xwayland: false, terminal: false, class: "unknown".into() };
         }
     };
 
-    let xwayland = json
-        .get("xwayland")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let xwayland = json.get("xwayland").and_then(|v| v.as_bool()).unwrap_or(false);
+    let class = json.get("class").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+
+    // Check Hyprland tags for "terminal" — set by window rules
+    let terminal = json.get("tags")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tags| {
+            tags.iter().any(|t| t.as_str().is_some_and(|s| s.starts_with("terminal")))
+        });
+
     if xwayland {
-        let class = json
-            .get("class")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        info!(class, "focused window is XWayland");
+        info!(class = %class, terminal, "focused window is XWayland");
     }
-    xwayland
+
+    FocusedWindow { xwayland, terminal, class }
 }
 
 /// Check that required tools are available.
@@ -224,11 +287,15 @@ pub fn check_wtype() -> Result<()> {
         .arg("--help")
         .output()
         .context("wtype not found - install with: pacman -S wtype")?;
-    // wl-copy with --primary for backup clipboard (doesn't affect Ctrl+C/Ctrl+V)
+    // wl-copy/wl-paste for clipboard-based pasting
     Command::new("wl-copy")
         .args(["--primary", "--help"])
         .output()
         .context("wl-copy not found - install with: pacman -S wl-clipboard")?;
+    Command::new("wl-paste")
+        .arg("--help")
+        .output()
+        .context("wl-paste not found - install with: pacman -S wl-clipboard")?;
     Command::new("xdotool")
         .arg("--version")
         .output()
