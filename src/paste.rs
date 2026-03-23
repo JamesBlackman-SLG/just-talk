@@ -22,7 +22,7 @@ pub fn paste_text(text: &str) -> Result<()> {
 
     // Sanitize: replace newlines with spaces — ASR models sometimes produce them,
     // and wtype/xdotool would press Return, which sends messages in chat apps
-    let text = text.replace('\n', " ").replace('\r', " ");
+    let text = text.replace(['\n', '\r'], " ");
 
     // Collapse multiple spaces that may result from newline replacement
     let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");

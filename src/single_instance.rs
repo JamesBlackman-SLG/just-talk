@@ -31,8 +31,8 @@ pub fn acquire(name: &str) -> anyhow::Result<Option<Lock>> {
         let name_bytes = name.as_bytes();
         let max_len = addr.sun_path.len() - 1; // reserve byte 0 for \0
         let copy_len = name_bytes.len().min(max_len);
-        for i in 0..copy_len {
-            addr.sun_path[i + 1] = name_bytes[i] as libc::c_char;
+        for (i, &byte) in name_bytes.iter().enumerate().take(copy_len) {
+            addr.sun_path[i + 1] = byte as libc::c_char;
         }
 
         let addr_len = std::mem::size_of::<libc::sa_family_t>() + 1 + copy_len;

@@ -105,18 +105,18 @@ impl App {
     }
 
     fn select_dropdown_item(&mut self) {
-        if let Some(idx) = self.dropdown_state.selected() {
-            if let Some(item) = self.dropdown_items.get(idx) {
-                let value = if item == "(none)" {
-                    String::new()
-                } else {
-                    item.clone()
-                };
-                match self.selected {
-                    FIELD_INPUT_DEVICE => self.input_device = value,
-                    FIELD_BLIP_DEVICE => self.blip_device = value,
-                    _ => {}
-                }
+        if let Some(idx) = self.dropdown_state.selected()
+            && let Some(item) = self.dropdown_items.get(idx)
+        {
+            let value = if item == "(none)" {
+                String::new()
+            } else {
+                item.clone()
+            };
+            match self.selected {
+                FIELD_INPUT_DEVICE => self.input_device = value,
+                FIELD_BLIP_DEVICE => self.blip_device = value,
+                _ => {}
             }
         }
         self.dropdown_open = false;
@@ -149,11 +149,11 @@ impl App {
             let text = String::from_utf8_lossy(&output.stdout);
             let my_pid = std::process::id();
             for tok in text.split_whitespace() {
-                if let Ok(pid) = tok.parse::<u32>() {
-                    if pid != my_pid {
-                        unsafe {
-                            libc::kill(pid as i32, libc::SIGHUP);
-                        }
+                if let Ok(pid) = tok.parse::<u32>()
+                    && pid != my_pid
+                {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGHUP);
                     }
                 }
             }
