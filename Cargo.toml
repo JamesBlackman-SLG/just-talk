@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 evdev = "0.12"
+inotify = "0.11"
 midir = "0.10"
 cpal = "0.15"
 hound = "3.5"
